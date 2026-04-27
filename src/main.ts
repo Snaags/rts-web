@@ -174,68 +174,76 @@ app.canvas.addEventListener("webglcontextrestored", () => {
 const world = new Container();
 app.stage.addChild(world);
 
+/**
+ * Apply the current zoom + pan to the world container.
+ *
+ * The world is always centered in the viewport at zero pan; `panX`/`panY`
+ * are additive offsets driven by edge-pan, middle-mouse drag, and the
+ * cursor-anchored zoom math in the wheel handler. We only CLAMP pan in
+ * here -- never reset it -- because resetting would silently undo the
+ * cursor-anchor adjustment the wheel handler just computed.
+ *
+ * Pan is allowed to push the map a `PAN_MARGIN` fraction off either edge
+ * so the player can peek slightly past the boundary; beyond that the
+ * clamp keeps the map roughly on-screen.
+ */
 function fitWorld() {
   const sx = window.innerWidth / MAP_W;
   const sy = window.innerHeight / MAP_H;
   const baseScale = Math.min(sx, sy);
   const s = baseScale * zoomLevel;
-  
   const scaledW = MAP_W * s;
   const scaledH = MAP_H * s;
-  
-  const mapFillsViewport = scaledW <= window.innerWidth && scaledH <= window.innerHeight;
-  
   const PAN_MARGIN = 0.33;
-  
-  if (mapFillsViewport) {
-    panX = 0;
-    panY = 0;
-  } else {
-    const minPanX = window.innerWidth - scaledW - (scaledW * PAN_MARGIN);
-    const maxPanX = scaledW * PAN_MARGIN;
-    const minPanY = window.innerHeight - scaledH - (scaledH * PAN_MARGIN);
-    const maxPanY = scaledH * PAN_MARGIN;
-    
-    panX = Math.max(minPanX, Math.min(maxPanX, panX));
-    panY = Math.max(minPanY, Math.min(maxPanY, panY));
-  }
-  
+
+  // Center the map by default; pan offsets layer on top.
+  const cx = (window.innerWidth - scaledW) / 2;
+  const cy = (window.innerHeight - scaledH) / 2;
+
+  // Allowed pan range: enough to fully expose any side that's off-screen,
+  // plus PAN_MARGIN of the scaled map size as overshoot slack.
+  const slackX =
+    Math.max(0, scaledW - window.innerWidth) + scaledW * PAN_MARGIN;
+  const slackY =
+    Math.max(0, scaledH - window.innerHeight) + scaledH * PAN_MARGIN;
+  panX = Math.max(-slackX, Math.min(slackX, panX));
+  panY = Math.max(-slackY, Math.min(slackY, panY));
+
   world.scale.set(s);
-  
-  if (mapFillsViewport) {
-    world.position.set(
-      (window.innerWidth - scaledW) / 2,
-      (window.innerHeight - scaledH) / 2,
-    );
-  } else {
-    world.position.set(panX, panY);
-  }
+  world.position.set(cx + panX, cy + panY);
 }
 fitWorld();
 window.addEventListener("resize", fitWorld);
 
-app.canvas.addEventListener("wheel", (e) => {
-  e.preventDefault();
-  const delta = e.deltaY > 0 ? 0.9 : 1.1;
-  const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel * delta));
-  
-  const rect = app.canvas.getBoundingClientRect();
-  const mouseRelX = e.clientX - rect.left;
-  const mouseRelY = e.clientY - rect.top;
-  
-  const worldX = (mouseRelX - world.position.x) / world.scale.x;
-  const worldY = (mouseRelY - world.position.y) / world.scale.y;
-  
-  zoomLevel = newZoom;
-  fitWorld();
-  
-  const newScreenX = worldX * world.scale.x + world.position.x;
-  const newScreenY = worldY * world.scale.y + world.position.y;
-  
-  panX += mouseRelX - newScreenX;
-  panY += mouseRelY - newScreenY;
-  fitWorld();
-}, { passive: false });
+// Mouse-wheel zoom, anchored at the cursor: the world point under the
+// cursor before the zoom should remain under the cursor after the zoom.
+// We compute the post-zoom screen position of that world point, and push
+// `panX`/`panY` by the gap so it lands back on the cursor.
+app.canvas.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel * delta));
+    if (newZoom === zoomLevel) return;
+
+    const rect = app.canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    // World point currently under the cursor.
+    const worldX = (mx - world.position.x) / world.scale.x;
+    const worldY = (my - world.position.y) / world.scale.y;
+
+    zoomLevel = newZoom;
+    fitWorld();
+
+    // Push pan by however far that world point drifted from the cursor.
+    panX += mx - (worldX * world.scale.x + world.position.x);
+    panY += my - (worldY * world.scale.y + world.position.y);
+    fitWorld();
+  },
+  { passive: false },
+);
 
 let isPanning = false;
 let lastPanMouseX = 0;
