@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rts-web</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #0b0d10; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
+      #app { position: absolute; inset: 0; }
+      #hud { position: absolute; top: 8px; left: 8px; pointer-events: none; font-size: 12px; opacity: 0.85; line-height: 1.4; }
+      #hud b { color: #8ecaff; }
+      #right-panel {
+        position: absolute; top: 8px; right: 8px;
+        display: flex; flex-direction: column; gap: 6px; width: 240px;
+      }
+      #upgrades {
+        background: rgba(15, 18, 22, 0.85); border: 1px solid #2a3138;
+        border-radius: 6px; padding: 8px 10px; font-size: 12px;
+        line-height: 1.35; user-select: none;
+      }
+      #upgrades .head { color: #8ecaff; margin-bottom: 6px; font-weight: 600; letter-spacing: 0.3px; }
+      #upgrades .row {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 4px 6px; margin: 2px -4px; border-radius: 4px; cursor: pointer;
+        transition: background 80ms;
+      }
+      #upgrades .row:hover { background: rgba(140, 200, 255, 0.08); }
+      #upgrades .row.disabled { cursor: default; opacity: 0.45; }
+      #upgrades .row.disabled:hover { background: transparent; }
+      #upgrades .row.maxed { color: #c8e3a4; opacity: 0.7; cursor: default; }
+      #upgrades .row.maxed:hover { background: transparent; }
+      #upgrades .key {
+        display: inline-block; min-width: 16px; padding: 0 5px;
+        border: 1px solid #555; border-radius: 3px; margin-right: 8px;
+        text-align: center; color: #cfd6dd;
+      }
+      #upgrades .name { flex: 1; }
+      #upgrades .lvl { color: #aaa; margin: 0 6px; }
+      #upgrades .desc { color: #8ad0a0; min-width: 60px; text-align: right; }
+      #groups {
+        background: rgba(15, 18, 22, 0.85); border: 1px solid #2a3138;
+        border-radius: 6px; padding: 6px 8px; font-size: 12px;
+        user-select: none; min-height: 16px;
+      }
+      #groups:empty::before {
+        content: "No groups (Ctrl+0–9 to bind)";
+        color: #5a6168; font-style: italic;
+      }
+      #groups .grp {
+        display: inline-flex; align-items: center; gap: 4px;
+        margin-right: 4px; padding: 2px 5px;
+        background: #1a1f25; border: 1px solid #2a3138;
+        border-radius: 4px; cursor: pointer;
+        transition: background 80ms;
+      }
+      #groups .grp:hover { background: rgba(140, 200, 255, 0.12); }
+      #groups .grpkey {
+        background: #2a3138; border-radius: 3px; padding: 0 5px;
+        color: #cfd6dd; min-width: 12px; text-align: center;
+      }
+      #groups .grpcount { color: #8ad0a0; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div><b>Left-click drag</b> select &nbsp; <b>Right-click</b> move (or attack a clicked enemy) &nbsp; <b>A + click</b> attack-move &nbsp; <b>S</b> stop &nbsp; <b>B</b> toggle ballistics</div>
+      <div><b>Ctrl+0–9</b> bind selection to group &nbsp; <b>0–9</b> select group &nbsp; <b>Shift+0–9</b> add group to selection &nbsp; <b>Q W E R T</b> buy upgrade</div>
+      <div>Projectiles have travel time &mdash; dodge them by moving!</div>
+      <div id="stats"></div>
+    </div>
+    <div id="right-panel">
+      <div id="upgrades"></div>
+      <div id="groups"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

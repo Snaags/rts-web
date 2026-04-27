@@ -1,0 +1,812 @@
+import { Application, Container, Graphics, Rectangle, Text } from "pixi.js";
+import {
+  ClientMsg,
+  EntityId,
+  MAP_H,
+  MAP_W,
+  PROJ_RADIUS,
+  PlayerStats,
+  ProjectileState,
+  ServerMsg,
+  Snapshot,
+  UNIT_ATTACK_WINDUP,
+  UNIT_RADIUS,
+  UPGRADES,
+  UPGRADE_ORDER,
+  UnitState,
+  UpgradeKind,
+  effectiveRange,
+  emptyUpgrades,
+} from "../shared/protocol";
+
+const INTERP_DELAY_MS = 100;
+
+interface Buffered {
+  recvTime: number;
+  serverTime: number;
+  units: Map<EntityId, UnitState>;
+  projectiles: Map<EntityId, ProjectileState>;
+}
+
+const snapshots: Buffered[] = [];
+let myPlayer = 0;
+let myUnitIds = new Set<EntityId>();
+let selected = new Set<EntityId>();
+let attackModePending = false;
+let serverTimeOffset = 0; // serverTime - clientTime at recv
+let serverOptions = { ballistics: false };
+let myStats: PlayerStats = { kills: 0, points: 0, upgrades: emptyUpgrades() };
+// Control groups 0-9. Each holds a stable set of unit ids; dead units are
+// pruned each snapshot so a group of 5 archers becomes a group of 4 etc.
+const controlGroups = new Map<number, Set<EntityId>>();
+
+const statsEl = document.getElementById("stats")!;
+const upgradesEl = document.getElementById("upgrades")!;
+const groupsEl = document.getElementById("groups")!;
+
+// Visible boot/connection status. Renders even if Pixi or the WS dies, so
+// failures over Cloudflare/Caddy/etc. are diagnosable without devtools.
+const statusEl = document.createElement("div");
+statusEl.id = "status";
+statusEl.style.cssText =
+  "position:absolute;bottom:8px;left:8px;font-size:12px;font-family:ui-monospace,monospace;opacity:0.85;color:#ddd;pointer-events:none;";
+document.body.appendChild(statusEl);
+let bootStage = "starting";
+let wsStage = "idle";
+let lastSnapAt = 0;
+function renderStatus(extra = "") {
+  const since = lastSnapAt ? `${Math.round(performance.now() - lastSnapAt)}ms ago` : "never";
+  statusEl.textContent = `boot=${bootStage}  ws=${wsStage}  lastSnap=${since}${extra ? "  " + extra : ""}`;
+}
+renderStatus();
+window.addEventListener("error", (e) => {
+  bootStage = `error: ${e.message}`;
+  renderStatus();
+});
+window.addEventListener("unhandledrejection", (e) => {
+  bootStage = `rejected: ${(e.reason && e.reason.message) || e.reason}`;
+  renderStatus();
+});
+
+// Kick off the WebSocket connection NOW, before awaiting Pixi, so the
+// status line works even if rendering hangs. (See the WS handler block below
+// for the actual onmessage logic.)
+const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+wsStage = `connecting (${wsUrl})`;
+renderStatus();
+const ws = new WebSocket(wsUrl);
+
+// Renderer config:
+//   - prefer WebGL (WebGPU is patchy in some browsers)
+//   - preferWebGLVersion: 1  -- WebGL2 has known driver crashes on some
+//     Intel iGPUs / software-rendering paths that manifest as immediate
+//     context loss. WebGL1 has the broadest support and Pixi v8 still works
+//     correctly on it.
+//   - antialias off (cheaper, fewer driver paths)
+//   - allow software rendering (don't bail on perf caveats)
+//   - low-power preference (uses iGPU on hybrid laptops, more stable)
+const app = new Application();
+const PIXI_INIT_TIMEOUT_MS = 15000;
+async function tryInit(opts: Parameters<typeof app.init>[0]): Promise<void> {
+  await Promise.race([
+    app.init(opts),
+    new Promise((_, rej) =>
+      setTimeout(
+        () => rej(new Error(`pixi init timed out after ${PIXI_INIT_TIMEOUT_MS}ms`)),
+        PIXI_INIT_TIMEOUT_MS,
+      ),
+    ),
+  ]);
+}
+
+try {
+  bootStage = "pixi-init webgl1";
+  renderStatus();
+  await tryInit({
+    resizeTo: window,
+    background: 0x0b0d10,
+    antialias: false,
+    preference: "webgl",
+    preferWebGLVersion: 1,
+    powerPreference: "low-power",
+    failIfMajorPerformanceCaveat: false,
+  } as Parameters<typeof app.init>[0]);
+  bootStage = "pixi-ok (webgl1)";
+  renderStatus();
+} catch (err1) {
+  // Fallback: try WebGL2 in case WebGL1 isn't available on this browser
+  console.warn("[client] webgl1 init failed, retrying webgl2", err1);
+  bootStage = "pixi-init webgl2 (fallback)";
+  renderStatus();
+  try {
+    await tryInit({
+      resizeTo: window,
+      background: 0x0b0d10,
+      antialias: false,
+      preference: "webgl",
+      powerPreference: "low-power",
+      failIfMajorPerformanceCaveat: false,
+    } as Parameters<typeof app.init>[0]);
+    bootStage = "pixi-ok (webgl2)";
+    renderStatus();
+  } catch (err2) {
+    bootStage = `pixi-failed: ${(err2 as Error).message}`;
+    renderStatus();
+    throw err2;
+  }
+}
+document.getElementById("app")!.appendChild(app.canvas);
+// Surface WebGL context loss/restoration as it happens.
+app.canvas.addEventListener("webglcontextlost", (e) => {
+  e.preventDefault();
+  bootStage = "webgl-context-lost";
+  renderStatus();
+});
+app.canvas.addEventListener("webglcontextrestored", () => {
+  bootStage = "webgl-restored";
+  renderStatus();
+});
+
+// World container, centered + scaled to fit
+const world = new Container();
+app.stage.addChild(world);
+
+function fitWorld() {
+  const sx = window.innerWidth / MAP_W;
+  const sy = window.innerHeight / MAP_H;
+  const s = Math.min(sx, sy);
+  world.scale.set(s);
+  world.position.set(
+    (window.innerWidth - MAP_W * s) / 2,
+    (window.innerHeight - MAP_H * s) / 2,
+  );
+}
+fitWorld();
+window.addEventListener("resize", fitWorld);
+
+// Background
+const bg = new Graphics()
+  .rect(0, 0, MAP_W, MAP_H)
+  .fill(0x14181d)
+  .stroke({ width: 2, color: 0x2a313a });
+world.addChild(bg);
+
+// Grid
+const grid = new Graphics();
+for (let x = 0; x <= MAP_W; x += 100) {
+  grid.moveTo(x, 0).lineTo(x, MAP_H);
+}
+for (let y = 0; y <= MAP_H; y += 100) {
+  grid.moveTo(0, y).lineTo(MAP_W, y);
+}
+grid.stroke({ width: 1, color: 0x1d242c });
+world.addChild(grid);
+
+const unitsLayer = new Container();
+world.addChild(unitsLayer);
+const projLayer = new Container();
+world.addChild(projLayer);
+const overlayLayer = new Container();
+world.addChild(overlayLayer);
+
+const unitGfx = new Map<EntityId, Graphics>();
+const groupLabelGfx = new Map<EntityId, Text>();
+const projGfx = new Map<EntityId, Graphics>();
+const selectionRing = new Graphics();
+overlayLayer.addChild(selectionRing);
+const dragBox = new Graphics();
+overlayLayer.addChild(dragBox);
+const moveMarker = new Graphics();
+overlayLayer.addChild(moveMarker);
+let moveMarkerAt = 0;
+
+// Networking - the `ws` object was created above (before Pixi init); we just
+// attach the message/lifecycle handlers here.
+ws.onopen = () => {
+  wsStage = "open";
+  renderStatus();
+  console.log("[client] connected");
+};
+ws.onclose = (e) => {
+  wsStage = `closed code=${e.code}${e.reason ? " " + e.reason : ""}`;
+  renderStatus();
+  console.log("[client] disconnected", e.code, e.reason);
+};
+ws.onerror = () => {
+  wsStage = "error";
+  renderStatus();
+};
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data) as ServerMsg;
+  if (msg.t === "hello") {
+    myPlayer = msg.you;
+    myUnitIds = new Set(msg.unitIds);
+    wsStage = `hello P${myPlayer}`;
+    renderStatus();
+    return;
+  }
+  if (msg.t === "snap") {
+    const now = Date.now();
+    serverTimeOffset = msg.serverTime - now;
+    if (msg.options) serverOptions = msg.options;
+    if (msg.myStats) {
+      myStats = msg.myStats;
+      renderUpgradePanel();
+    }
+    lastSnapAt = performance.now();
+    wsStage = `streaming P${myPlayer}`;
+    renderStatus();
+    const buf: Buffered = {
+      recvTime: now,
+      serverTime: msg.serverTime,
+      units: new Map(msg.units.map((u) => [u.id, u])),
+      projectiles: new Map(msg.projectiles.map((p) => [p.id, p])),
+    };
+    snapshots.push(buf);
+    // Cull old
+    while (snapshots.length > 60) snapshots.shift();
+    // Drop stale selection
+    for (const id of [...selected]) {
+      if (!buf.units.has(id)) selected.delete(id);
+    }
+    // Prune dead units from control groups; auto-clear groups that hit zero.
+    let groupsChanged = false;
+    for (const [n, ids] of controlGroups) {
+      const before = ids.size;
+      for (const id of [...ids]) if (!buf.units.has(id)) ids.delete(id);
+      if (ids.size === 0) {
+        controlGroups.delete(n);
+        groupsChanged = true;
+      } else if (ids.size !== before) {
+        groupsChanged = true;
+      }
+    }
+    if (groupsChanged) renderGroupsPanel();
+    if (myUnitIds.size === 0) {
+      myUnitIds = new Set(
+        msg.units.filter((u) => u.owner === myPlayer).map((u) => u.id),
+      );
+    }
+  }
+};
+
+function send(msg: ClientMsg) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// Input
+const screenToWorld = (sx: number, sy: number) => {
+  return {
+    x: (sx - world.position.x) / world.scale.x,
+    y: (sy - world.position.y) / world.scale.y,
+  };
+};
+
+let dragStart: { x: number; y: number } | null = null;
+let dragNow: { x: number; y: number } | null = null;
+
+app.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// Hit-test: return the id of the enemy unit nearest to (wx, wy), or null
+// if no enemy is within unit-radius + a small forgiving margin.
+function pickEnemyAt(wx: number, wy: number): EntityId | null {
+  const latest = snapshots[snapshots.length - 1];
+  if (!latest) return null;
+  let bestId: EntityId | null = null;
+  let bestD = (UNIT_RADIUS + 4) ** 2;
+  for (const u of latest.units.values()) {
+    if (u.owner === myPlayer) continue;
+    const d = (u.x - wx) ** 2 + (u.y - wy) ** 2;
+    if (d < bestD) {
+      bestD = d;
+      bestId = u.id;
+    }
+  }
+  return bestId;
+}
+
+window.addEventListener("mousedown", (e) => {
+  const w = screenToWorld(e.clientX, e.clientY);
+  if (e.button === 0) {
+    if (attackModePending) {
+      const enemyId = pickEnemyAt(w.x, w.y);
+      if (enemyId !== null && selected.size > 0) {
+        issueAttack(enemyId);
+      } else {
+        issueMove(w.x, w.y, true);
+      }
+      attackModePending = false;
+      document.body.style.cursor = "default";
+      return;
+    }
+    dragStart = w;
+    dragNow = w;
+  } else if (e.button === 2) {
+    const enemyId = pickEnemyAt(w.x, w.y);
+    if (enemyId !== null && selected.size > 0) {
+      issueAttack(enemyId);
+    } else {
+      issueMove(w.x, w.y, false);
+    }
+  }
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (dragStart) dragNow = screenToWorld(e.clientX, e.clientY);
+});
+
+window.addEventListener("mouseup", (e) => {
+  if (e.button !== 0 || !dragStart || !dragNow) return;
+  const x0 = Math.min(dragStart.x, dragNow.x);
+  const y0 = Math.min(dragStart.y, dragNow.y);
+  const x1 = Math.max(dragStart.x, dragNow.x);
+  const y1 = Math.max(dragStart.y, dragNow.y);
+  const isClick = x1 - x0 < 4 && y1 - y0 < 4;
+  const latest = snapshots[snapshots.length - 1];
+  if (latest) {
+    if (isClick) {
+      // Pick single unit nearest to click
+      const cx = (x0 + x1) / 2;
+      const cy = (y0 + y1) / 2;
+      let bestId: EntityId | null = null;
+      let bestD = (UNIT_RADIUS + 6) ** 2;
+      for (const u of latest.units.values()) {
+        if (u.owner !== myPlayer) continue;
+        const d = (u.x - cx) ** 2 + (u.y - cy) ** 2;
+        if (d < bestD) {
+          bestD = d;
+          bestId = u.id;
+        }
+      }
+      selected.clear();
+      if (bestId !== null) selected.add(bestId);
+    } else {
+      selected.clear();
+      for (const u of latest.units.values()) {
+        if (u.owner !== myPlayer) continue;
+        if (u.x >= x0 && u.x <= x1 && u.y >= y0 && u.y <= y1) selected.add(u.id);
+      }
+    }
+  }
+  dragStart = null;
+  dragNow = null;
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "a" || e.key === "A") {
+    if (selected.size > 0) {
+      attackModePending = true;
+      document.body.style.cursor = "crosshair";
+    }
+  } else if (e.key === "s" || e.key === "S") {
+    if (selected.size > 0) {
+      send({ t: "stop", ids: [...selected] });
+    }
+  } else if (e.key === "b" || e.key === "B") {
+    send({ t: "option", ballistics: !serverOptions.ballistics });
+  } else if (e.key === "Escape") {
+    attackModePending = false;
+    document.body.style.cursor = "default";
+    selected.clear();
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+    // Select all owned units
+    const latest = snapshots[snapshots.length - 1];
+    if (latest) {
+      selected.clear();
+      for (const u of latest.units.values())
+        if (u.owner === myPlayer) selected.add(u.id);
+    }
+  } else if (/^[0-9]$/.test(e.key)) {
+    // Control groups (RTS standard):
+    //   Ctrl+N        -> bind currently selected units to group N (replace).
+    //                    With nothing selected, this clears group N.
+    //   Shift+N       -> add group N's units to current selection.
+    //   N             -> replace selection with group N's living units.
+    e.preventDefault();
+    const n = parseInt(e.key, 10);
+    if (e.ctrlKey || e.metaKey) {
+      if (selected.size === 0) {
+        controlGroups.delete(n);
+      } else {
+        // Snapshot the selection at bind time. Filter to owned + alive.
+        const latest = snapshots[snapshots.length - 1];
+        const bound = new Set<EntityId>();
+        for (const id of selected) {
+          const u = latest?.units.get(id);
+          if (u && u.owner === myPlayer) bound.add(id);
+        }
+        if (bound.size === 0) {
+          controlGroups.delete(n);
+        } else {
+          // Each unit belongs to AT MOST one group: strip these ids from
+          // any other group, deleting groups that go empty.
+          const toDelete: number[] = [];
+          for (const [otherN, otherIds] of controlGroups) {
+            if (otherN === n) continue;
+            for (const id of bound) otherIds.delete(id);
+            if (otherIds.size === 0) toDelete.push(otherN);
+          }
+          for (const k of toDelete) controlGroups.delete(k);
+          controlGroups.set(n, bound);
+        }
+      }
+      renderGroupsPanel();
+    } else {
+      const group = controlGroups.get(n);
+      if (!group || group.size === 0) return;
+      const latest = snapshots[snapshots.length - 1];
+      if (!latest) return;
+      // Filter to alive + still-owned. The snapshot pass below also prunes
+      // dead ids from the group itself, but be defensive here too.
+      const alive: EntityId[] = [];
+      for (const id of group)
+        if (latest.units.get(id)?.owner === myPlayer) alive.push(id);
+      if (alive.length === 0) {
+        controlGroups.delete(n);
+        renderGroupsPanel();
+        return;
+      }
+      if (e.shiftKey) {
+        for (const id of alive) selected.add(id);
+      } else {
+        selected = new Set(alive);
+      }
+    }
+  } else if (
+    e.key === "q" || e.key === "Q" ||
+    e.key === "w" || e.key === "W" ||
+    e.key === "e" || e.key === "E" ||
+    e.key === "r" || e.key === "R" ||
+    e.key === "t" || e.key === "T"
+  ) {
+    // Upgrade hotkeys (moved off 1-5 so digits can drive control groups).
+    const map: Record<string, UpgradeKind> = {
+      q: "range",
+      w: "ballistics",
+      e: "moveSpeed",
+      r: "projectileSpeed",
+      t: "damage",
+    };
+    const kind = map[e.key.toLowerCase()];
+    if (kind) buyUpgrade(kind);
+  }
+});
+
+function buyUpgrade(kind: UpgradeKind) {
+  const def = UPGRADES[kind];
+  const cur = myStats.upgrades[kind] ?? 0;
+  if (cur >= def.max) return;
+  if (myStats.points <= 0) return;
+  send({ t: "upgrade", kind });
+  // Optimistic local prediction so the UI doesn't lag a tick behind:
+  // server will overwrite via the next snapshot (authoritative).
+  myStats = {
+    kills: myStats.kills,
+    points: myStats.points - 1,
+    upgrades: { ...myStats.upgrades, [kind]: cur + 1 },
+  };
+  renderUpgradePanel();
+}
+
+function renderUpgradePanel() {
+  const head = `<div class="head">Kills: ${myStats.kills} &nbsp;·&nbsp; Points: ${myStats.points}</div>`;
+  const rows = UPGRADE_ORDER.map((kind) => {
+    const def = UPGRADES[kind];
+    const lvl = myStats.upgrades[kind] ?? 0;
+    const maxed = lvl >= def.max;
+    const affordable = !maxed && myStats.points > 0;
+    const cls = maxed ? "row maxed" : affordable ? "row" : "row disabled";
+    const desc = maxed ? "MAX" : def.describe(lvl + 1);
+    return `<div class="${cls}" data-kind="${kind}"><span class="key">${def.hotkey}</span><span class="name">${def.name}</span><span class="lvl">${lvl}/${def.max}</span><span class="desc">${desc}</span></div>`;
+  }).join("");
+  upgradesEl.innerHTML = head + rows;
+}
+
+upgradesEl.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement;
+  const row = target.closest(".row") as HTMLElement | null;
+  if (!row) return;
+  const kind = row.getAttribute("data-kind") as UpgradeKind | null;
+  if (!kind) return;
+  buyUpgrade(kind);
+});
+
+function renderGroupsPanel() {
+  if (controlGroups.size === 0) {
+    groupsEl.innerHTML = "";
+    return;
+  }
+  // Show populated groups in numeric order.
+  const keys = [...controlGroups.keys()].sort((a, b) => a - b);
+  const cells = keys
+    .map((n) => {
+      const count = controlGroups.get(n)?.size ?? 0;
+      return `<span class="grp"><span class="grpkey">${n}</span><span class="grpcount">${count}</span></span>`;
+    })
+    .join("");
+  groupsEl.innerHTML = cells;
+}
+
+// Click on a group cell selects that group (mouse equivalent of pressing N).
+groupsEl.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement;
+  const grp = target.closest(".grp") as HTMLElement | null;
+  if (!grp) return;
+  const keyEl = grp.querySelector(".grpkey");
+  if (!keyEl) return;
+  const n = parseInt(keyEl.textContent ?? "", 10);
+  if (Number.isNaN(n)) return;
+  const group = controlGroups.get(n);
+  const latest = snapshots[snapshots.length - 1];
+  if (!group || !latest) return;
+  const alive: EntityId[] = [];
+  for (const id of group)
+    if (latest.units.get(id)?.owner === myPlayer) alive.push(id);
+  if (alive.length > 0) selected = new Set(alive);
+});
+
+// Initial render so the panels show even before the first snapshot arrives.
+renderUpgradePanel();
+renderGroupsPanel();
+
+function issueMove(x: number, y: number, attackMove: boolean) {
+  if (selected.size === 0) return;
+  send({ t: "move", ids: [...selected], x, y, attackMove });
+  moveMarkerAt = performance.now();
+  moveMarker.clear();
+  moveMarker
+    .circle(x, y, 10)
+    .stroke({ width: 2, color: attackMove ? 0xff5050 : 0x50ff80 });
+}
+
+function issueAttack(targetId: EntityId) {
+  if (selected.size === 0) return;
+  send({ t: "attack", ids: [...selected], targetId });
+  // Marker drawn at the target's current position; the renderer then
+  // lerps it along with everything else for the brief fade-out.
+  const latest = snapshots[snapshots.length - 1];
+  const t = latest?.units.get(targetId);
+  if (t) {
+    moveMarkerAt = performance.now();
+    moveMarker.clear();
+    moveMarker
+      .circle(t.x, t.y, UNIT_RADIUS + 6)
+      .stroke({ width: 2, color: 0xff3030 });
+  }
+}
+
+// Render loop with interpolation
+function getInterpolated(): {
+  units: Map<EntityId, UnitState>;
+  projectiles: Map<EntityId, ProjectileState>;
+} | null {
+  if (snapshots.length === 0) return null;
+  const renderServerTime = Date.now() + serverTimeOffset - INTERP_DELAY_MS;
+  // Find two snapshots straddling renderServerTime
+  let a: Buffered | null = null;
+  let b: Buffered | null = null;
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    if (snapshots[i].serverTime <= renderServerTime) {
+      a = snapshots[i];
+      b = snapshots[i + 1] ?? null;
+      break;
+    }
+  }
+  if (!a) a = snapshots[0];
+  if (!b) {
+    return { units: a.units, projectiles: a.projectiles };
+  }
+  const span = b.serverTime - a.serverTime;
+  const t = span > 0 ? (renderServerTime - a.serverTime) / span : 0;
+  const tt = Math.max(0, Math.min(1, t));
+
+  const units = new Map<EntityId, UnitState>();
+  for (const [id, ua] of a.units) {
+    const ub = b.units.get(id);
+    if (!ub) {
+      units.set(id, ua);
+    } else {
+      units.set(id, {
+        ...ub,
+        x: ua.x + (ub.x - ua.x) * tt,
+        y: ua.y + (ub.y - ua.y) * tt,
+        // Only smooth windup if both samples agree it's increasing; resets to 0
+        // are instantaneous so the visual snaps off cleanly when the unit moves.
+        windup: ub.windup < ua.windup ? ub.windup : ua.windup + (ub.windup - ua.windup) * tt,
+      });
+    }
+  }
+  const projectiles = new Map<EntityId, ProjectileState>();
+  for (const [id, pa] of a.projectiles) {
+    const pb = b.projectiles.get(id);
+    if (!pb) {
+      projectiles.set(id, pa);
+    } else {
+      projectiles.set(id, {
+        ...pb,
+        x: pa.x + (pb.x - pa.x) * tt,
+        y: pa.y + (pb.y - pa.y) * tt,
+      });
+    }
+  }
+  return { units, projectiles };
+}
+
+function colorForOwner(owner: number, mine: boolean) {
+  if (mine) return 0x4fa3ff;
+  // Cycle through some hostile colors
+  const palette = [0xff5050, 0xffaa3a, 0xc066ff, 0x66ff99];
+  return palette[(owner - 1) % palette.length];
+}
+
+app.ticker.add(() => {
+  const state = getInterpolated();
+  // Drag box
+  dragBox.clear();
+  if (dragStart && dragNow) {
+    const x0 = Math.min(dragStart.x, dragNow.x);
+    const y0 = Math.min(dragStart.y, dragNow.y);
+    const w = Math.abs(dragNow.x - dragStart.x);
+    const h = Math.abs(dragNow.y - dragStart.y);
+    dragBox
+      .rect(x0, y0, w, h)
+      .fill({ color: 0x4fa3ff, alpha: 0.08 })
+      .stroke({ width: 1, color: 0x4fa3ff });
+  }
+
+  // Move marker fade
+  const age = performance.now() - moveMarkerAt;
+  moveMarker.alpha = Math.max(0, 1 - age / 600);
+
+  if (!state) return;
+
+  // Units
+  const seenU = new Set<EntityId>();
+  for (const u of state.units.values()) {
+    seenU.add(u.id);
+    let g = unitGfx.get(u.id);
+    if (!g) {
+      g = new Graphics();
+      unitsLayer.addChild(g);
+      unitGfx.set(u.id, g);
+    }
+    g.clear();
+    const mine = u.owner === myPlayer;
+    const col = colorForOwner(u.owner, mine);
+    g.circle(0, 0, UNIT_RADIUS).fill(col).stroke({ width: 1, color: 0x000000 });
+    // Windup indicator: bright inner pip that grows from 0 to ~UNIT_RADIUS-2
+    // as windup progresses; pops off the moment the shot fires or unit moves.
+    const wfrac = Math.max(0, Math.min(1, u.windup / UNIT_ATTACK_WINDUP));
+    if (wfrac > 0) {
+      const r = 1.5 + wfrac * (UNIT_RADIUS - 3);
+      g.circle(0, 0, r).fill({ color: 0xfff0a0, alpha: 0.55 + 0.4 * wfrac });
+    }
+    // HP bar
+    const w = 22;
+    const frac = Math.max(0, u.hp / u.maxHp);
+    g.rect(-w / 2, -UNIT_RADIUS - 8, w, 3).fill(0x222831);
+    g.rect(-w / 2, -UNIT_RADIUS - 8, w * frac, 3).fill(
+      frac > 0.5 ? 0x66dd66 : frac > 0.25 ? 0xddaa44 : 0xdd4444,
+    );
+    g.position.set(u.x, u.y);
+  }
+  for (const [id, g] of unitGfx) {
+    if (!seenU.has(id)) {
+      g.destroy();
+      unitGfx.delete(id);
+    }
+  }
+
+  // Selection rings + range indicator
+  selectionRing.clear();
+  // Selection is owned-units-only, so myStats.upgrades.range applies to all
+  // of them. Recomputed each frame so it tracks newly-bought upgrades.
+  const myRange = effectiveRange(myStats.upgrades.range);
+  for (const id of selected) {
+    const u = state.units.get(id);
+    if (!u) continue;
+    // Light grey range circle so the player can see firing reach.
+    selectionRing
+      .circle(u.x, u.y, myRange)
+      .stroke({ width: 1, color: 0xaaaaaa, alpha: 0.25 });
+    // Tight green selection ring on top.
+    selectionRing
+      .circle(u.x, u.y, UNIT_RADIUS + 4)
+      .stroke({ width: 2, color: 0x6cf07a });
+    // If this unit has a focused-fire target, draw a faint red line + small
+    // ring around the target so the player can see who's locked.
+    if (u.attackTargetId !== null) {
+      const t = state.units.get(u.attackTargetId);
+      if (t) {
+        selectionRing
+          .moveTo(u.x, u.y)
+          .lineTo(t.x, t.y)
+          .stroke({ width: 1, color: 0xff5555, alpha: 0.35 });
+        selectionRing
+          .circle(t.x, t.y, UNIT_RADIUS + 5)
+          .stroke({ width: 1.5, color: 0xff5050, alpha: 0.7 });
+      }
+    }
+  }
+
+  // Control-group badges: tiny number above selected units that belong to
+  // a group. Each unit belongs to at most one group (enforced at bind time).
+  const groupOf = new Map<EntityId, number>();
+  for (const [n, ids] of controlGroups) {
+    for (const id of ids) groupOf.set(id, n);
+  }
+  const seenLabels = new Set<EntityId>();
+  for (const id of selected) {
+    const u = state.units.get(id);
+    if (!u) continue;
+    const grp = groupOf.get(id);
+    if (grp === undefined) continue;
+    let lbl = groupLabelGfx.get(id);
+    if (!lbl) {
+      lbl = new Text({
+        text: String(grp),
+        style: {
+          fontFamily: "system-ui, sans-serif",
+          fontSize: 10,
+          fontWeight: "600",
+          fill: 0x0b0d10,
+          stroke: { color: 0xcfd6dd, width: 3, join: "round" },
+        },
+      });
+      lbl.anchor.set(0.5, 0.5);
+      overlayLayer.addChild(lbl);
+      groupLabelGfx.set(id, lbl);
+    }
+    const txt = String(grp);
+    if (lbl.text !== txt) lbl.text = txt;
+    // Top-right of the unit, just above the HP bar.
+    lbl.position.set(u.x + UNIT_RADIUS + 2, u.y - UNIT_RADIUS - 6);
+    seenLabels.add(id);
+  }
+  for (const [id, lbl] of groupLabelGfx) {
+    if (!seenLabels.has(id)) {
+      lbl.destroy();
+      groupLabelGfx.delete(id);
+    }
+  }
+
+  // Projectiles
+  const seenP = new Set<EntityId>();
+  for (const p of state.projectiles.values()) {
+    seenP.add(p.id);
+    let g = projGfx.get(p.id);
+    if (!g) {
+      g = new Graphics();
+      projLayer.addChild(g);
+      projGfx.set(p.id, g);
+    }
+    g.clear();
+    const mine = p.owner === myPlayer;
+    g.circle(0, 0, PROJ_RADIUS).fill(mine ? 0xb6e3ff : 0xffd070);
+    g.position.set(p.x, p.y);
+  }
+  for (const [id, g] of projGfx) {
+    if (!seenP.has(id)) {
+      g.destroy();
+      projGfx.delete(id);
+    }
+  }
+
+  // Stats
+  const latest = snapshots[snapshots.length - 1];
+  const myAlive = latest
+    ? [...latest.units.values()].filter((u) => u.owner === myPlayer).length
+    : 0;
+  const enemies = latest
+    ? [...latest.units.values()].filter((u) => u.owner !== myPlayer).length
+    : 0;
+  statsEl.textContent = `you=P${myPlayer} units=${myAlive} enemies=${enemies} sel=${selected.size} ballistics=${serverOptions.ballistics ? "ON" : "off"}`;
+});
+
+// Prevent text selection on drag
+document.body.addEventListener("selectstart", (e) => e.preventDefault());
+
+// Hint pixi about hit area
+app.stage.eventMode = "static";
+app.stage.hitArea = new Rectangle(0, 0, 99999, 99999);
