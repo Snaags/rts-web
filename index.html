@@ -79,6 +79,58 @@
       #leaderboard .rank { color: #6a7480; min-width: 18px; text-align: right; }
       #leaderboard .who { flex: 1; color: #cfd6dd; }
       #leaderboard .kills { color: #8ad0a0; min-width: 28px; text-align: right; }
+
+      /* ---- Match HUD (top-center) ---- */
+      #match {
+        position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+        background: rgba(15, 18, 22, 0.92); border: 1px solid #2a3138;
+        border-radius: 6px; padding: 8px 12px; font-size: 12px; min-width: 320px;
+        user-select: none; pointer-events: none; line-height: 1.4;
+      }
+      #match .mhead { color: #8ecaff; font-weight: 600; margin-bottom: 6px; letter-spacing: 0.3px; }
+      #match .mempty { color: #5a6168; font-style: italic; }
+      #match .mrow {
+        display: flex; align-items: center; gap: 8px; padding: 2px 0;
+      }
+      #match .mrow.me .mwho { color: #cfe0ff; font-weight: 600; }
+      #match .mwho { min-width: 28px; color: #cfd6dd; }
+      #match .mbar {
+        flex: 1; height: 8px; background: #1a1f25;
+        border-radius: 3px; overflow: hidden; border: 1px solid #2a3138;
+      }
+      #match .mfill {
+        height: 100%; transition: width 120ms linear, background 200ms;
+      }
+      #match .mscore { color: #aaa; min-width: 70px; text-align: right; }
+
+      /* ---- Vote prompt (center) ---- */
+      #vote {
+        position: absolute; top: 35%; left: 50%; transform: translate(-50%, -50%);
+        background: rgba(15, 18, 22, 0.95); border: 1px solid #4fa3ff;
+        border-radius: 8px; padding: 14px 22px; font-size: 14px;
+        text-align: center; user-select: none; pointer-events: none;
+        box-shadow: 0 6px 24px rgba(79, 163, 255, 0.25);
+      }
+      #vote .vhead { color: #8ecaff; font-weight: 600; font-size: 16px; }
+      #vote .vsub { color: #aaa; margin: 6px 0; font-size: 12px; }
+      #vote .vrow { display: flex; gap: 16px; justify-content: center; margin-top: 6px; }
+      #vote .vchoice {
+        padding: 4px 10px; border: 1px solid #2a3138; border-radius: 4px;
+        font-size: 12px; color: #cfd6dd;
+      }
+      #vote .vchoice.yes { border-color: #4fa3ff; color: #cfe0ff; }
+      #vote .vchoice.no { border-color: #ff5050; color: #ffcfcf; }
+
+      /* ---- Winner banner (center) ---- */
+      #banner {
+        position: absolute; top: 30%; left: 50%; transform: translate(-50%, -50%);
+        background: rgba(15, 18, 22, 0.95); border: 1px solid #8ad0a0;
+        border-radius: 8px; padding: 16px 28px; font-size: 14px;
+        text-align: center; user-select: none; pointer-events: none;
+      }
+      #banner .bhead { color: #c8e3a4; font-weight: 700; font-size: 22px; letter-spacing: 0.5px; }
+      #banner .bsub { color: #aaa; margin-top: 6px; font-size: 12px; }
+      #banner .bfade { color: #5a6168; margin-top: 4px; font-size: 11px; }
     </style>
   </head>
   <body>
@@ -86,6 +138,7 @@
     <div id="hud">
       <div><b>Left-click drag</b> select &nbsp; <b>Right-click</b> move (or attack a clicked enemy) &nbsp; <b>A + click</b> attack-move &nbsp; <b>S</b> stop &nbsp; <b>B</b> toggle ballistics</div>
       <div><b>Ctrl+0–9</b> bind group &nbsp; <b>0–9</b> select group &nbsp; <b>Shift+0–9</b> add group &nbsp; <b>QWERT</b> use ability &nbsp; <b>Shift+QWERT</b> buy ability &nbsp; <b>Shift+ASDFG</b> buy upgrade</div>
+      <div><b>M</b> propose Hardpoint match &nbsp; <b>Y/N</b> vote on a pending proposal</div>
       <div>Projectiles have travel time &mdash; dodge them by moving!</div>
       <div id="stats"></div>
     </div>
@@ -94,6 +147,9 @@
       <div id="groups"></div>
       <div id="leaderboard"></div>
     </div>
+    <div id="match" style="display:none"></div>
+    <div id="vote" style="display:none"></div>
+    <div id="banner" style="display:none"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

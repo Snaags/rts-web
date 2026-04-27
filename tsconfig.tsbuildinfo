@@ -1,1 +1,1 @@
-{"root":["./src/main.ts","./server/index.ts","./shared/protocol.ts"],"version":"5.9.3"}
+{"root":["./src/main.ts","./server/index.ts","./server/match.ts","./shared/protocol.ts"],"version":"5.9.3"}

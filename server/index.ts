@@ -33,11 +33,13 @@ import {
   AbilityKind,
   BLINK_MAX_DIST,
   BLINK_MOVE_LOCK_SEC,
+  BOT_PLAYER,
   LeaderboardEntry,
   effectiveRange,
   emptyAbilities,
   emptyUpgrades,
 } from "../shared/protocol.js";
+import { MatchManager } from "./match.js";
 
 interface Client {
   ws: WebSocket;
@@ -49,8 +51,6 @@ let nextEntityId = 1;
 let nextPlayerId = 1;
 let tick = 0;
 
-// Reserved owner id for bot/dummy enemies (kept out of human player range)
-const BOT_PLAYER: PlayerId = 9999;
 const BOT_COUNT = parseInt(process.env.BOTS ?? "6", 10);
 const BOT_RESPAWN = (process.env.BOT_RESPAWN ?? "1") !== "0";
 
@@ -208,9 +208,31 @@ function ensureBots() {
       botState.delete(id);
     }
   }
+  // Skip respawning entirely while a match is in progress -- modes like
+  // Hardpoint remove bots at start and want them to stay gone until the
+  // match ends.
+  if (matchManager.isInMatch()) return;
   if (!BOT_RESPAWN && botUnitIds.size === 0) return;
   while (botUnitIds.size < BOT_COUNT) spawnBot();
 }
+
+/** Despawn every bot. Called by the match manager when a match starts. */
+function removeAllBots() {
+  for (const id of botUnitIds) units.delete(id);
+  botUnitIds.clear();
+  botState.clear();
+}
+
+/** One-shot bot spawn up to BOT_COUNT (used at match end regardless of BOT_RESPAWN). */
+function spawnBotsToCount() {
+  while (botUnitIds.size < BOT_COUNT) spawnBot();
+}
+
+const matchManager = new MatchManager({
+  removeBots: removeAllBots,
+  spawnBots: spawnBotsToCount,
+  connectedHumans: () => [...clients].map((c) => c.player),
+});
 
 function dist2(ax: number, ay: number, bx: number, by: number) {
   const dx = ax - bx;
@@ -714,6 +736,9 @@ function buildSnapshot(forPlayer: PlayerId): Snapshot {
   }
   // Stable sort: kills desc, then player id asc as a deterministic tiebreaker.
   leaderboard.sort((a, b) => b.kills - a.kills || a.player - b.player);
+  const match = matchManager.publicMatchState(units) ?? undefined;
+  const vote = matchManager.publicVoteState() ?? undefined;
+  const matchEnded = matchManager.endedBannerState() ?? undefined;
   return {
     t: "snap",
     tick,
@@ -729,6 +754,9 @@ function buildSnapshot(forPlayer: PlayerId): Snapshot {
       abilities: { ...s.abilities },
     },
     leaderboard,
+    match,
+    vote,
+    matchEnded,
   };
 }
 
@@ -935,12 +963,17 @@ wss.on("connection", (ws) => {
       );
     } else if (msg.t === "useAbility") {
       castAbility(player, client, msg.kind, msg.ids, msg.x, msg.y);
+    } else if (msg.t === "proposeMatch") {
+      matchManager.proposeMatch(player, msg.mode);
+    } else if (msg.t === "vote") {
+      matchManager.castVote(player, msg.choice);
     }
   });
 
   ws.on("close", () => {
     clients.delete(client);
     for (const id of client.unitIds) units.delete(id);
+    matchManager.onPlayerDisconnected(player);
     // Keep playerStats around after disconnect so the leaderboard still
     // shows the player's score (with `connected: false`). They're cheap
     // to retain and re-attaching by player id isn't currently supported.
@@ -957,6 +990,11 @@ setInterval(() => {
   tick++;
   updateBotAI();
   step(dt);
+  // Match logic AFTER physics so the hardpoint scan reads post-step
+  // positions. Match may end and trigger spawnBots on its way out, which
+  // is fine -- next ensureBots() call below will be a no-op in that tick
+  // (already at count) and the cycle resumes normally next tick.
+  matchManager.tick(units, dt);
   ensureBots();
   broadcast();
 }, 1000 / TICK_HZ);

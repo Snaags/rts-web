@@ -3,11 +3,15 @@ import {
   ABILITIES,
   ABILITY_ORDER,
   AbilityKind,
+  BOT_PLAYER,
   ClientMsg,
   EntityId,
+  HARDPOINT_WIN_SECONDS,
   LeaderboardEntry,
   MAP_H,
   MAP_W,
+  MatchEndedPublicState,
+  MatchPublicState,
   PROJ_RADIUS,
   PlayerStats,
   ProjectileState,
@@ -19,6 +23,7 @@ import {
   UPGRADE_ORDER,
   UnitState,
   UpgradeKind,
+  VotePublicState,
   effectiveRange,
   emptyAbilities,
   emptyUpgrades,
@@ -69,6 +74,15 @@ const upgradesEl = document.getElementById("upgrades")!;
 const groupsEl = document.getElementById("groups")!;
 const leaderboardEl = document.getElementById("leaderboard")!;
 let leaderboard: LeaderboardEntry[] = [];
+const matchEl = document.getElementById("match")!;
+const voteEl = document.getElementById("vote")!;
+const bannerEl = document.getElementById("banner")!;
+// Match overlay state. All three are independent and we re-render
+// whenever any of them changes (every snapshot, since cooldown timers
+// inside them tick continuously).
+let matchState: MatchPublicState | undefined;
+let voteState: VotePublicState | undefined;
+let endedBanner: MatchEndedPublicState | undefined;
 
 // Visible boot/connection status. Renders even if Pixi or the WS dies, so
 // failures over Cloudflare/Caddy/etc. are diagnosable without devtools.
@@ -308,6 +322,10 @@ const projLayer = new Container();
 world.addChild(projLayer);
 const overlayLayer = new Container();
 world.addChild(overlayLayer);
+// Hardpoint hill -- rendered below units/projectiles so it acts as a
+// "stained glass" floor highlight rather than overlapping unit sprites.
+const hillGfx = new Graphics();
+world.addChildAt(hillGfx, 2); // above bg + grid, below units
 
 const unitGfx = new Map<EntityId, Graphics>();
 const groupLabelGfx = new Map<EntityId, Text>();
@@ -356,6 +374,10 @@ ws.onmessage = (ev) => {
       leaderboard = msg.leaderboard;
       renderLeaderboard();
     }
+    matchState = msg.match;
+    voteState = msg.vote;
+    endedBanner = msg.matchEnded;
+    renderMatchOverlays();
     // Re-render the panel each snap so ability cooldown counters tick
     // visibly even when myStats itself didn't change.
     renderUpgradePanel();
@@ -549,6 +571,14 @@ window.addEventListener("keydown", (e) => {
     }
   } else if ((e.key === "b" || e.key === "B") && !e.shiftKey) {
     send({ t: "option", ballistics: !serverOptions.ballistics });
+  } else if ((e.key === "m" || e.key === "M") && !e.shiftKey) {
+    // Propose a Hardpoint match. Server rejects silently if a match or
+    // vote is already active, or the post-vote cooldown is in effect.
+    send({ t: "proposeMatch", mode: "hardpoint" });
+  } else if ((e.key === "y" || e.key === "Y") && voteState) {
+    send({ t: "vote", choice: "yes" });
+  } else if ((e.key === "n" || e.key === "N") && voteState) {
+    send({ t: "vote", choice: "no" });
   } else if (e.key === "Escape") {
     attackModePending = false;
     document.body.style.cursor = "default";
@@ -829,16 +859,99 @@ function renderLeaderboard() {
         .filter(Boolean)
         .join(" ");
       const tag = e.connected ? "" : " (offline)";
-      return `<div class="${cls}"><span class="rank">#${i + 1}</span><span class="who">P${e.player}${tag}</span><span class="kills">${e.kills}</span></div>`;
+      const col = playerColorCss(e.player);
+      return `<div class="${cls}"><span class="rank">#${i + 1}</span><span class="who" style="color:${col}">P${e.player}${tag}</span><span class="kills">${e.kills}</span></div>`;
     })
     .join("");
   leaderboardEl.innerHTML = `<div class="head">Leaderboard</div>` + rows;
+}
+
+/**
+ * Render all match-related HUD: the active-match score panel, the vote
+ * prompt overlay, and the post-match winner banner. Each is independent
+ * and may be visible alone or together (e.g. winner banner + new vote).
+ */
+function renderMatchOverlays() {
+  // Active match score panel (top-center).
+  if (matchState) {
+    const m = matchState;
+    const remainSec = Math.max(0, (m.endsAt - Date.now()) / 1000);
+    const status = m.contested
+      ? `<span style="color:#ffaa3a">CONTESTED</span>`
+      : m.holder !== null
+        ? `<span style="color:#8ad0a0">P${m.holder} holding</span>`
+        : `<span style="color:#6a7480">empty</span>`;
+    const rows = m.scores
+      .map((s) => {
+        const pct = Math.min(100, (s.points / m.winTarget) * 100);
+        const me = s.player === myPlayer ? " me" : "";
+        const col = playerColorCss(s.player);
+        return `<div class="mrow${me}">
+          <span class="mwho" style="color:${col}">P${s.player}</span>
+          <div class="mbar"><div class="mfill" style="width:${pct}%;background:${col}"></div></div>
+          <span class="mscore">${s.points.toFixed(1)}/${m.winTarget}s</span>
+        </div>`;
+      })
+      .join("");
+    matchEl.innerHTML = `
+      <div class="mhead">HARDPOINT &middot; ${status} &middot; cap ${remainSec.toFixed(0)}s</div>
+      ${rows || `<div class="mempty">no scores yet</div>`}
+    `;
+    matchEl.style.display = "";
+  } else {
+    matchEl.style.display = "none";
+  }
+
+  // Vote prompt overlay (center).
+  if (voteState) {
+    const v = voteState;
+    const remain = Math.max(0, (v.expiresAt - Date.now()) / 1000);
+    const youVotedYes = v.yes.includes(myPlayer);
+    const youVotedNo = v.no.includes(myPlayer);
+    const yLabel = youVotedYes ? "YES (you)" : "press Y";
+    const nLabel = youVotedNo ? "NO (you)" : "press N";
+    voteEl.innerHTML = `
+      <div class="vhead">P${v.proposedBy} proposes <b>${v.mode}</b></div>
+      <div class="vsub">${remain.toFixed(0)}s left &middot; need ${v.yes.length}/${v.needYes} yes</div>
+      <div class="vrow">
+        <span class="vchoice yes">${yLabel}</span>
+        <span class="vchoice no">${nLabel}</span>
+      </div>
+    `;
+    voteEl.style.display = "";
+  } else {
+    voteEl.style.display = "none";
+  }
+
+  // Winner banner (center, fades briefly).
+  if (endedBanner) {
+    const b = endedBanner;
+    const remain = Math.max(0, (b.expiresAt - Date.now()) / 1000);
+    const title =
+      b.winner === null
+        ? "Match ended &mdash; no winner"
+        : b.winner === myPlayer
+          ? `<span style="color:${playerColorCss(b.winner)}">You win!</span>`
+          : `<span style="color:${playerColorCss(b.winner)}">P${b.winner} wins</span>`;
+    const scores = b.finalScores
+      .map((s) => `P${s.player}: ${s.points.toFixed(1)}s`)
+      .join(" &middot; ");
+    bannerEl.innerHTML = `
+      <div class="bhead">${title}</div>
+      <div class="bsub">${scores}</div>
+      <div class="bfade">${remain.toFixed(0)}s</div>
+    `;
+    bannerEl.style.display = "";
+  } else {
+    bannerEl.style.display = "none";
+  }
 }
 
 // Initial render so the panels show even before the first snapshot arrives.
 renderUpgradePanel();
 renderGroupsPanel();
 renderLeaderboard();
+renderMatchOverlays();
 
 function issueMove(x: number, y: number, attackMove: boolean) {
   if (selected.size === 0) return;
@@ -938,15 +1051,63 @@ function getInterpolated(): {
   return { units, projectiles };
 }
 
-function colorForOwner(owner: number, mine: boolean) {
-  if (mine) return 0x4fa3ff;
-  // Cycle through some hostile colors
-  const palette = [0xff5050, 0xffaa3a, 0xc066ff, 0x66ff99];
-  return palette[(owner - 1) % palette.length];
+// Player color is keyed purely on player id so every client agrees on
+// who is which color (P1 is the same blue from every viewer's screen).
+// Bots get a neutral grey so they're visually distinct from humans on a
+// busy battlefield.
+const PLAYER_PALETTE = [
+  0x4fa3ff, // P1 blue
+  0xff5050, // P2 red
+  0xffaa3a, // P3 orange
+  0xc066ff, // P4 purple
+  0x66ff99, // P5 green
+  0xffe966, // P6 yellow
+];
+const BOT_COLOR = 0x8a939c;
+function playerColor(playerId: number): number {
+  if (playerId === BOT_PLAYER) return BOT_COLOR;
+  return PLAYER_PALETTE[(playerId - 1) % PLAYER_PALETTE.length];
+}
+/**
+ * CSS hex string for the same color, used in HTML/CSS contexts (match
+ * score bars, leaderboard rows). Pads to 6 digits so #4fa3ff not #4fa3f.
+ */
+function playerColorCss(playerId: number): string {
+  return "#" + playerColor(playerId).toString(16).padStart(6, "0");
 }
 
 app.ticker.add(() => {
   const state = getInterpolated();
+
+  // Hardpoint hill. Color & alpha track holder/contested/empty so the
+  // floor highlight is the at-a-glance status indicator.
+  hillGfx.clear();
+  if (matchState) {
+    const h = matchState.hill;
+    let color = 0x8a939c; // empty
+    let alpha = 0.10;
+    if (matchState.contested) {
+      // Use a neutral amber for "fight in progress" rather than picking
+      // any one player's color -- nobody is the clear holder.
+      color = 0xffaa3a;
+      alpha = 0.18;
+    } else if (matchState.holder !== null) {
+      color = playerColor(matchState.holder);
+      alpha = 0.20;
+    }
+    hillGfx.circle(h.x, h.y, h.radius).fill({ color, alpha });
+    hillGfx.circle(h.x, h.y, h.radius).stroke({
+      width: 2,
+      color,
+      alpha: 0.6,
+    });
+  }
+
+  // Re-render the match overlays each frame so countdown timers tick
+  // smoothly (the server only resends snapshots at 30 Hz; this keeps the
+  // banner / vote / hard-cap counters animating between snaps).
+  if (matchState || voteState || endedBanner) renderMatchOverlays();
+
   // Drag box
   dragBox.clear();
   if (dragStart && dragNow) {
@@ -998,7 +1159,7 @@ app.ticker.add(() => {
     }
     g.clear();
     const mine = u.owner === myPlayer;
-    const col = colorForOwner(u.owner, mine);
+    const col = playerColor(u.owner);
     g.circle(0, 0, UNIT_RADIUS).fill(col).stroke({ width: 1, color: 0x000000 });
     // Windup indicator: bright inner pip that grows from 0 to ~UNIT_RADIUS-2
     // as windup progresses; pops off the moment the shot fires or unit moves.

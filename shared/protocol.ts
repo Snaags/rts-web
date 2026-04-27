@@ -5,6 +5,10 @@ export const TICK_DT = 1 / TICK_HZ;
 
 export type EntityId = number;
 export type PlayerId = number;
+// Reserved owner id for bot/dummy units. Lives in the shared protocol so
+// the client can render bots with a distinct color and exclude them from
+// human-only lists (leaderboard, hardpoint scoring) the same way.
+export const BOT_PLAYER: PlayerId = 9999;
 
 export interface UnitState {
   id: EntityId;
@@ -185,6 +189,12 @@ export interface Snapshot {
   // render directly. Includes every player that has ever connected (alive
   // or disconnected) and excludes bots.
   leaderboard: LeaderboardEntry[];
+  // Active match overlay state (when a mode like Hardpoint is running),
+  // pending vote prompt, and the winner-banner shown briefly post-match.
+  // All three are independent and any subset may be present.
+  match?: MatchPublicState;
+  vote?: VotePublicState;
+  matchEnded?: MatchEndedPublicState;
 }
 
 export interface LeaderboardEntry {
@@ -192,6 +202,58 @@ export interface LeaderboardEntry {
   kills: number;
   connected: boolean; // false if the player has left but their score remains
 }
+
+// ---------- Game modes / matches ----------
+// The server runs a "lobby + match overlay" model: the free-for-all-with-
+// bots world is always live; a Hardpoint match (or future mode) layers
+// extra rules on top, started by player vote.
+export type ModeId = "hardpoint";
+
+export interface MatchHill {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+export interface MatchScore {
+  player: PlayerId;
+  points: number; // seconds-of-solo-holding for hardpoint
+}
+
+export interface MatchPublicState {
+  mode: ModeId;
+  startedAt: number; // serverTime ms when the match started
+  endsAt: number;    // serverTime ms hard cap
+  winTarget: number; // points (seconds) needed to declare a winner outright
+  hill: MatchHill;
+  scores: MatchScore[]; // sorted by points desc, then player asc
+  holder: PlayerId | null; // null if empty or contested
+  contested: boolean;
+}
+
+export interface VotePublicState {
+  proposedBy: PlayerId;
+  mode: ModeId;
+  expiresAt: number; // serverTime ms
+  yes: PlayerId[];
+  no: PlayerId[];
+  needYes: number; // simple-majority threshold the server will use
+}
+
+export interface MatchEndedPublicState {
+  mode: ModeId;
+  winner: PlayerId | null; // null on tie/timeout-no-winner
+  finalScores: MatchScore[];
+  expiresAt: number; // banner clears at this serverTime
+}
+
+// Match tunables (shared so client/server agree)
+export const HARDPOINT_RADIUS = 150;
+export const HARDPOINT_WIN_SECONDS = 60;
+export const HARDPOINT_HARD_CAP_SECONDS = 300;
+export const VOTE_DURATION_SEC = 20;
+export const VOTE_COOLDOWN_SEC = 30;
+export const MATCH_END_BANNER_SEC = 5;
 
 export interface WelcomeMsg {
   t: "hello";
@@ -243,6 +305,16 @@ export interface UseAbilityCmd {
   y: number;
 }
 
+export interface ProposeMatchCmd {
+  t: "proposeMatch";
+  mode: ModeId;
+}
+
+export interface VoteCmd {
+  t: "vote";
+  choice: "yes" | "no";
+}
+
 export type ClientMsg =
   | MoveCmd
   | StopCmd
@@ -250,7 +322,9 @@ export type ClientMsg =
   | AttackCmd
   | BuyUpgradeCmd
   | BuyAbilityCmd
-  | UseAbilityCmd;
+  | UseAbilityCmd
+  | ProposeMatchCmd
+  | VoteCmd;
 
 // Tunables
 export const UNIT_RADIUS = 10;
