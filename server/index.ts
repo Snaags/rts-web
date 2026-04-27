@@ -59,6 +59,13 @@ const clients = new Set<Client>();
 const botUnitIds = new Set<number>();
 const playerStats = new Map<PlayerId, PlayerStats>();
 
+// Per-bot scratch state. Lives server-side only (not in the protocol).
+interface BotMem {
+  strafeDir: 1 | -1; // sign of perpendicular vector relative to target line
+  lastCd: number;    // previous tick's cooldown, used to detect "just fired"
+}
+const botMemory = new Map<number, BotMem>();
+
 function ensurePlayerStats(p: PlayerId): PlayerStats {
   let s = playerStats.get(p);
   if (!s) {
@@ -150,7 +157,10 @@ function spawnBot(): number {
 function ensureBots() {
   // Drop ids whose units died
   for (const id of [...botUnitIds]) {
-    if (!units.has(id)) botUnitIds.delete(id);
+    if (!units.has(id)) {
+      botUnitIds.delete(id);
+      botMemory.delete(id);
+    }
   }
   if (!BOT_RESPAWN && botUnitIds.size === 0) return;
   while (botUnitIds.size < BOT_COUNT) spawnBot();
@@ -373,13 +383,42 @@ function step(dt: number) {
     }
     if (!winding) u.windup = 0;
 
-    // Even when not winding (e.g. cooldown reloading), a locked unit that's
-    // already in range should HOLD position rather than walk into the target.
+    // Locked + in range, not winding (i.e. on cooldown). Default behavior
+    // is HOLD; bots instead strafe perpendicular to the target line so they
+    // don't sit still while reloading. Direction is picked once per shot
+    // (when cooldown rises) with a 70/30 persistence bias so bots tend to
+    // circle-strafe one way for a few shots before switching.
     if (hasLocked && !winding) {
       const d2 = dist2(u.x, u.y, lockedEnemy!.x, lockedEnemy!.y);
       const hold = eff.range - 4;
       if (d2 <= hold * hold) {
-        moveThisTick = false;
+        if (u.owner === BOT_PLAYER && u.cooldown > 0) {
+          let mem = botMemory.get(u.id);
+          if (!mem) {
+            mem = {
+              strafeDir: Math.random() < 0.5 ? -1 : 1,
+              lastCd: u.cooldown,
+            };
+            botMemory.set(u.id, mem);
+          } else if (u.cooldown > mem.lastCd) {
+            // Cooldown just rose -> we fired last tick. Re-pick with bias.
+            if (Math.random() < 0.3) {
+              mem.strafeDir = mem.strafeDir === 1 ? -1 : 1;
+            }
+          }
+          mem.lastCd = u.cooldown;
+          // Perpendicular: rotate (dx,dy) 90deg, scaled by direction sign.
+          const dx = lockedEnemy!.x - u.x;
+          const dy = lockedEnemy!.y - u.y;
+          const d = Math.hypot(dx, dy) || 1;
+          const px = (-dy / d) * mem.strafeDir;
+          const py = (dx / d) * mem.strafeDir;
+          u.x += px * eff.speed * dt;
+          u.y += py * eff.speed * dt;
+          moveThisTick = false; // skip the default chase/hold path
+        } else {
+          moveThisTick = false; // player units / winding bots: just hold
+        }
       }
     }
 
