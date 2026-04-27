@@ -19,6 +19,14 @@ export interface UnitState {
   targetY: number | null;
   attackMove: boolean;
   attackTargetId: EntityId | null; // focused-fire target (overrides nearest)
+  // Sparse map of per-unit ability cooldowns in seconds. Missing keys are
+  // ready (cooldown 0). Server prunes keys when they tick down to zero.
+  abilityCds?: Partial<Record<AbilityKind, number>>;
+  // Brief post-blink (or other displacement) lockout in seconds. While > 0
+  // the unit ignores its own movement intent, giving the teleport a clean
+  // landing instead of letting the prior command resume mid-step. Field is
+  // omitted from snapshots when zero.
+  moveLockSec?: number;
 }
 
 export interface ProjectileState {
@@ -59,34 +67,36 @@ export function effectiveRange(rangeLevel: number): number {
   return UNIT_RANGE + RANGE_PER_LEVEL * rangeLevel;
 }
 
+// All purchasable rows are bought with shift+letter. The bare letters are
+// reserved for game actions (e.g. plain `a` is still attack-move).
 export const UPGRADES: Record<UpgradeKind, UpgradeDef> = {
   range: {
     name: "Range",
-    hotkey: "Q",
+    hotkey: "⇧A",
     max: 5,
     describe: (l) => `+${l * RANGE_PER_LEVEL} px`,
   },
   ballistics: {
     name: "Ballistics",
-    hotkey: "W",
+    hotkey: "⇧S",
     max: 1,
     describe: (l) => (l > 0 ? "lead targets" : "off"),
   },
   moveSpeed: {
     name: "Move Speed",
-    hotkey: "E",
+    hotkey: "⇧D",
     max: 5,
     describe: (l) => `+${l * 15}%`,
   },
   projectileSpeed: {
     name: "Projectile Speed",
-    hotkey: "R",
+    hotkey: "⇧F",
     max: 5,
     describe: (l) => `+${l * 30}%`,
   },
   damage: {
     name: "Damage",
-    hotkey: "T",
+    hotkey: "⇧G",
     max: 5,
     describe: (l) => `+${l * 20}%`,
   },
@@ -104,10 +114,52 @@ export type UpgradeLevels = Record<UpgradeKind, number>;
 
 export const KILLS_PER_POINT = 2;
 
+// ---------- Abilities ----------
+// Abilities are unlocked the same way upgrades are (1 point), but instead
+// of stacking levels they enable a per-unit, cooldown-gated action. Slot
+// hotkeys live on the row above upgrades: Shift+Q W E R T.
+export type AbilityKind = "blink";
+
+export interface AbilityDef {
+  name: string;
+  hotkey: string;
+  max: number; // always 1 -- abilities are binary unlocked / not
+  cooldownSec: number; // per-unit cooldown after each use
+  describe: (level: number) => string;
+}
+
+// Tunables for individual abilities are kept here so client + server agree.
+export const BLINK_MAX_DIST = 200; // px -- max teleport distance per cast
+export const BLINK_COOLDOWN = 6; // s -- per-unit reuse cooldown
+export const BLINK_MOVE_LOCK_SEC = 0.2; // s -- post-blink "settle" window
+
+export const ABILITIES: Record<AbilityKind, AbilityDef> = {
+  blink: {
+    // Hotkey shown in the panel is the CAST key (bare letter). Buying is
+    // always Shift+key for both abilities and upgrades; the HUD line at
+    // the top of the page documents the buy modifier.
+    name: "Blink",
+    hotkey: "Q",
+    max: 1,
+    cooldownSec: BLINK_COOLDOWN,
+    describe: (l) =>
+      l > 0 ? `${BLINK_MAX_DIST}px / ${BLINK_COOLDOWN}s cd` : "locked",
+  },
+};
+
+export const ABILITY_ORDER: AbilityKind[] = ["blink"];
+
+export type AbilityLevels = Record<AbilityKind, number>;
+
+export function emptyAbilities(): AbilityLevels {
+  return { blink: 0 };
+}
+
 export interface PlayerStats {
   kills: number;
   points: number; // unspent upgrade points
   upgrades: UpgradeLevels;
+  abilities: AbilityLevels;
 }
 
 export function emptyUpgrades(): UpgradeLevels {
@@ -168,12 +220,27 @@ export interface BuyUpgradeCmd {
   kind: UpgradeKind;
 }
 
+export interface BuyAbilityCmd {
+  t: "buyAbility";
+  kind: AbilityKind;
+}
+
+export interface UseAbilityCmd {
+  t: "useAbility";
+  kind: AbilityKind;
+  ids: EntityId[];
+  x: number;
+  y: number;
+}
+
 export type ClientMsg =
   | MoveCmd
   | StopCmd
   | OptionCmd
   | AttackCmd
-  | BuyUpgradeCmd;
+  | BuyUpgradeCmd
+  | BuyAbilityCmd
+  | UseAbilityCmd;
 
 // Tunables
 export const UNIT_RADIUS = 10;

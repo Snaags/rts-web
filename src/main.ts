@@ -1,5 +1,8 @@
 import { Application, Container, Graphics, Rectangle, Text } from "pixi.js";
 import {
+  ABILITIES,
+  ABILITY_ORDER,
+  AbilityKind,
   ClientMsg,
   EntityId,
   MAP_H,
@@ -16,6 +19,7 @@ import {
   UnitState,
   UpgradeKind,
   effectiveRange,
+  emptyAbilities,
   emptyUpgrades,
 } from "../shared/protocol";
 
@@ -35,7 +39,16 @@ let selected = new Set<EntityId>();
 let attackModePending = false;
 let serverTimeOffset = 0; // serverTime - clientTime at recv
 let serverOptions = { ballistics: false };
-let myStats: PlayerStats = { kills: 0, points: 0, upgrades: emptyUpgrades() };
+let myStats: PlayerStats = {
+  kills: 0,
+  points: 0,
+  upgrades: emptyUpgrades(),
+  abilities: emptyAbilities(),
+};
+// Last known cursor position in WORLD coordinates. Updated on every
+// mousemove so abilities like Blink can fire instantly toward where the
+// player is currently pointing without a separate targeting step.
+let lastMouseWorld: { x: number; y: number } = { x: 0, y: 0 };
 // Control groups 0-9. Each holds a stable set of unit ids; dead units are
 // pruned each snapshot so a group of 5 archers becomes a group of 4 etc.
 const controlGroups = new Map<number, Set<EntityId>>();
@@ -231,8 +244,10 @@ ws.onmessage = (ev) => {
     if (msg.options) serverOptions = msg.options;
     if (msg.myStats) {
       myStats = msg.myStats;
-      renderUpgradePanel();
     }
+    // Re-render the panel each snap so ability cooldown counters tick
+    // visibly even when myStats itself didn't change.
+    renderUpgradePanel();
     lastSnapAt = performance.now();
     wsStage = `streaming P${myPlayer}`;
     renderStatus();
@@ -287,8 +302,14 @@ let dragNow: { x: number; y: number } | null = null;
 
 app.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-// Hit-test: return the id of the enemy unit nearest to (wx, wy), or null
-// if no enemy is within unit-radius + a small forgiving margin.
+/**
+ * Hit-test for an enemy unit at world coordinates `(wx, wy)`.
+ *
+ * Iterates the latest snapshot, returns the id of the closest enemy
+ * within `UNIT_RADIUS + 4` px (a small forgiving margin so clicks don't
+ * have to be pixel-perfect), or `null` if none. Used by both right-click
+ * and `A`+click to decide between "issue attack lock" and "issue move".
+ */
 function pickEnemyAt(wx: number, wy: number): EntityId | null {
   const latest = snapshots[snapshots.length - 1];
   if (!latest) return null;
@@ -332,7 +353,9 @@ window.addEventListener("mousedown", (e) => {
 });
 
 window.addEventListener("mousemove", (e) => {
-  if (dragStart) dragNow = screenToWorld(e.clientX, e.clientY);
+  const w = screenToWorld(e.clientX, e.clientY);
+  lastMouseWorld = w;
+  if (dragStart) dragNow = w;
 });
 
 window.addEventListener("mouseup", (e) => {
@@ -373,16 +396,47 @@ window.addEventListener("mouseup", (e) => {
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "a" || e.key === "A") {
+  // Hotkey scheme:
+  //   Shift+QWERT -> BUY the corresponding ability slot
+  //   plain QWERT -> USE the corresponding ability (if unlocked) on the
+  //                  current selection, toward the cursor
+  //   Shift+ASDFG -> BUY the corresponding upgrade slot
+  //   plain  ASDFG -> existing game actions (a=attack-move, s=stop, ...)
+  // We check this block before anything else so it always wins.
+  if (/^[a-zA-Z]$/.test(e.key)) {
+    const k = e.key.toLowerCase();
+    const abilityIdx = "qwert".indexOf(k);
+    if (abilityIdx !== -1) {
+      const kind = ABILITY_ORDER[abilityIdx];
+      if (kind) {
+        e.preventDefault();
+        if (e.shiftKey) buyAbility(kind);
+        else useAbility(kind);
+        return;
+      }
+    }
+    if (e.shiftKey) {
+      const upgradeIdx = "asdfg".indexOf(k);
+      if (upgradeIdx !== -1) {
+        const kind = UPGRADE_ORDER[upgradeIdx];
+        if (kind) {
+          e.preventDefault();
+          buyUpgrade(kind);
+          return;
+        }
+      }
+    }
+  }
+  if ((e.key === "a" || e.key === "A") && !e.shiftKey) {
     if (selected.size > 0) {
       attackModePending = true;
       document.body.style.cursor = "crosshair";
     }
-  } else if (e.key === "s" || e.key === "S") {
+  } else if ((e.key === "s" || e.key === "S") && !e.shiftKey) {
     if (selected.size > 0) {
       send({ t: "stop", ids: [...selected] });
     }
-  } else if (e.key === "b" || e.key === "B") {
+  } else if ((e.key === "b" || e.key === "B") && !e.shiftKey) {
     send({ t: "option", ballistics: !serverOptions.ballistics });
   } else if (e.key === "Escape") {
     attackModePending = false;
@@ -453,63 +507,157 @@ window.addEventListener("keydown", (e) => {
         selected = new Set(alive);
       }
     }
-  } else if (
-    e.key === "q" || e.key === "Q" ||
-    e.key === "w" || e.key === "W" ||
-    e.key === "e" || e.key === "E" ||
-    e.key === "r" || e.key === "R" ||
-    e.key === "t" || e.key === "T"
-  ) {
-    // Upgrade hotkeys (moved off 1-5 so digits can drive control groups).
-    const map: Record<string, UpgradeKind> = {
-      q: "range",
-      w: "ballistics",
-      e: "moveSpeed",
-      r: "projectileSpeed",
-      t: "damage",
-    };
-    const kind = map[e.key.toLowerCase()];
-    if (kind) buyUpgrade(kind);
   }
 });
 
+/**
+ * Send a {@link BuyUpgradeCmd} to the server and optimistically reflect
+ * the change in the local UI.
+ *
+ * The server is authoritative — it validates points/level cap and the
+ * next snapshot will overwrite `myStats`. We mutate locally first so
+ * the panel responds within the same frame instead of after one tick of
+ * round-trip lag, which matters at io-game cadence.
+ */
 function buyUpgrade(kind: UpgradeKind) {
   const def = UPGRADES[kind];
   const cur = myStats.upgrades[kind] ?? 0;
   if (cur >= def.max) return;
   if (myStats.points <= 0) return;
   send({ t: "upgrade", kind });
-  // Optimistic local prediction so the UI doesn't lag a tick behind:
-  // server will overwrite via the next snapshot (authoritative).
   myStats = {
-    kills: myStats.kills,
+    ...myStats,
     points: myStats.points - 1,
     upgrades: { ...myStats.upgrades, [kind]: cur + 1 },
   };
   renderUpgradePanel();
 }
 
+/**
+ * Spend one upgrade point to unlock an ability slot. No-op if already
+ * unlocked or the player has no points.
+ *
+ * Same optimistic-update pattern as {@link buyUpgrade}: we mutate myStats
+ * locally and re-render so the panel responds within the same frame; the
+ * next snapshot from the server is authoritative.
+ */
+function buyAbility(kind: AbilityKind) {
+  const def = ABILITIES[kind];
+  const cur = myStats.abilities[kind] ?? 0;
+  if (cur >= def.max) return;
+  if (myStats.points <= 0) return;
+  send({ t: "buyAbility", kind });
+  myStats = {
+    ...myStats,
+    points: myStats.points - 1,
+    abilities: { ...myStats.abilities, [kind]: cur + 1 },
+  };
+  renderUpgradePanel();
+}
+
+/**
+ * Cast an ability on the current selection, targeted at the last known
+ * mouse position in world space. No-op if the ability isn't unlocked or
+ * nothing is selected. Per-unit cooldowns are enforced server-side, so
+ * we don't pre-filter the id list here.
+ */
+function useAbility(kind: AbilityKind) {
+  const cur = myStats.abilities[kind] ?? 0;
+  if (cur <= 0) return;
+  if (selected.size === 0) return;
+  send({
+    t: "useAbility",
+    kind,
+    ids: [...selected],
+    x: lastMouseWorld.x,
+    y: lastMouseWorld.y,
+  });
+}
+
+/**
+ * Render the right-side panel: a header with kills/points, then an
+ * Abilities section (one row per `ABILITY_ORDER` entry) and an Upgrades
+ * section (one row per `UPGRADE_ORDER` entry).
+ *
+ * Abilities show "locked" / "ready" / "X.Xs" (the smallest cooldown across
+ * the player's units that have started one). Upgrades show level/max +
+ * the next-level effect, or "MAX" when capped.
+ *
+ * Each row carries its kind in a `data-kind` attribute and its slot type
+ * in `data-slot` ("ability" or "upgrade") so the click handler can route
+ * back to the right buy/use function.
+ */
 function renderUpgradePanel() {
   const head = `<div class="head">Kills: ${myStats.kills} &nbsp;·&nbsp; Points: ${myStats.points}</div>`;
-  const rows = UPGRADE_ORDER.map((kind) => {
+
+  // Compute the smallest active cooldown across MY units, per ability.
+  const minCdByKind: Partial<Record<AbilityKind, number>> = {};
+  const latest = snapshots[snapshots.length - 1];
+  if (latest) {
+    for (const u of latest.units.values()) {
+      if (u.owner !== myPlayer) continue;
+      if (!u.abilityCds) continue;
+      for (const kind of ABILITY_ORDER) {
+        const cd = u.abilityCds[kind];
+        if (cd === undefined) continue;
+        const cur = minCdByKind[kind];
+        if (cur === undefined || cd < cur) minCdByKind[kind] = cd;
+      }
+    }
+  }
+
+  const abilityRows = ABILITY_ORDER.map((kind) => {
+    const def = ABILITIES[kind];
+    const lvl = myStats.abilities[kind] ?? 0;
+    const unlocked = lvl >= def.max;
+    let cls: string;
+    let desc: string;
+    if (!unlocked) {
+      const affordable = myStats.points > 0;
+      cls = affordable ? "row" : "row disabled";
+      desc = "BUY";
+    } else {
+      const cd = minCdByKind[kind];
+      if (cd !== undefined && cd > 0) {
+        cls = "row maxed"; // "owned but on cooldown"
+        desc = `${cd.toFixed(1)}s`;
+      } else {
+        cls = "row maxed";
+        desc = "READY";
+      }
+    }
+    return `<div class="${cls}" data-slot="ability" data-kind="${kind}"><span class="key">${def.hotkey}</span><span class="name">${def.name}</span><span class="lvl">${lvl}/${def.max}</span><span class="desc">${desc}</span></div>`;
+  }).join("");
+
+  const upgradeRows = UPGRADE_ORDER.map((kind) => {
     const def = UPGRADES[kind];
     const lvl = myStats.upgrades[kind] ?? 0;
     const maxed = lvl >= def.max;
     const affordable = !maxed && myStats.points > 0;
     const cls = maxed ? "row maxed" : affordable ? "row" : "row disabled";
     const desc = maxed ? "MAX" : def.describe(lvl + 1);
-    return `<div class="${cls}" data-kind="${kind}"><span class="key">${def.hotkey}</span><span class="name">${def.name}</span><span class="lvl">${lvl}/${def.max}</span><span class="desc">${desc}</span></div>`;
+    return `<div class="${cls}" data-slot="upgrade" data-kind="${kind}"><span class="key">${def.hotkey}</span><span class="name">${def.name}</span><span class="lvl">${lvl}/${def.max}</span><span class="desc">${desc}</span></div>`;
   }).join("");
-  upgradesEl.innerHTML = head + rows;
+
+  upgradesEl.innerHTML =
+    head +
+    `<div class="section">Abilities</div>` +
+    abilityRows +
+    `<div class="section">Upgrades</div>` +
+    upgradeRows;
 }
 
+// Clicking a panel row only BUYS (whether ability or upgrade). Casting
+// abilities is keyboard-only because a panel click has no target position.
 upgradesEl.addEventListener("click", (e) => {
   const target = e.target as HTMLElement;
   const row = target.closest(".row") as HTMLElement | null;
   if (!row) return;
-  const kind = row.getAttribute("data-kind") as UpgradeKind | null;
+  const slot = row.getAttribute("data-slot");
+  const kind = row.getAttribute("data-kind");
   if (!kind) return;
-  buyUpgrade(kind);
+  if (slot === "ability") buyAbility(kind as AbilityKind);
+  else buyUpgrade(kind as UpgradeKind);
 });
 
 function renderGroupsPanel() {
@@ -576,7 +724,22 @@ function issueAttack(targetId: EntityId) {
   }
 }
 
-// Render loop with interpolation
+/**
+ * Build a fully-interpolated world state for the current frame.
+ *
+ * The client renders at "render time" = `now - INTERP_DELAY_MS` (100 ms
+ * behind the latest server snapshot). We find the two buffered snapshots
+ * that straddle that timestamp and linearly interpolate every entity's
+ * position between them. Trading 100 ms of perceived input latency for
+ * smooth motion regardless of network jitter is the standard online-action
+ * trick.
+ *
+ * `windup` is interpolated only when increasing — when it drops (a shot
+ * fired, or the unit moved) we snap to the new value so the visual
+ * "charging" pip pops cleanly off, instead of fading.
+ *
+ * Returns `null` until the first snapshot arrives.
+ */
 function getInterpolated(): {
   units: Map<EntityId, UnitState>;
   projectiles: Map<EntityId, ProjectileState>;

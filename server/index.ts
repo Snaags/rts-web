@@ -29,7 +29,12 @@ import {
   UnitState,
   UpgradeKind,
   WelcomeMsg,
+  ABILITIES,
+  AbilityKind,
+  BLINK_MAX_DIST,
+  BLINK_MOVE_LOCK_SEC,
   effectiveRange,
+  emptyAbilities,
   emptyUpgrades,
 } from "../shared/protocol.js";
 
@@ -59,23 +64,41 @@ const clients = new Set<Client>();
 const botUnitIds = new Set<number>();
 const playerStats = new Map<PlayerId, PlayerStats>();
 
-// Per-bot scratch state. Lives server-side only (not in the protocol).
-interface BotMem {
-  strafeDir: 1 | -1; // sign of perpendicular vector relative to target line
-  lastCd: number;    // previous tick's cooldown, used to detect "just fired"
+// Default capability flags for newly spawned bots. Per-bot overrides can
+// be passed to spawnBot(). Currently only one capability:
+//   canStrafe -- if true, the bot circle-strafes around its target during
+//   reload cooldown. Off by default so bot AI matches the original
+//   "stand and shoot" behavior; future per-wave logic can flip this on.
+interface BotCaps {
+  canStrafe: boolean;
 }
-const botMemory = new Map<number, BotMem>();
+const DEFAULT_BOT_CAPS: BotCaps = {
+  canStrafe: (process.env.BOT_STRAFE ?? "0") !== "0",
+};
+
+// Per-bot server-side state. NOT part of the protocol -- the client doesn't
+// see this. Created at spawn time so the strafe gate is decided up front;
+// the `strafe` sub-state is filled in lazily on first cooldown.
+interface BotState {
+  caps: BotCaps;
+  strafe: { dir: 1 | -1; lastCd: number } | null;
+}
+const botState = new Map<number, BotState>();
 
 function ensurePlayerStats(p: PlayerId): PlayerStats {
   let s = playerStats.get(p);
   if (!s) {
-    s = { kills: 0, points: 0, upgrades: emptyUpgrades() };
+    s = {
+      kills: 0,
+      points: 0,
+      upgrades: emptyUpgrades(),
+      abilities: emptyAbilities(),
+    };
     playerStats.set(p, s);
   }
   return s;
 }
 
-// Effective stats per-unit (factor in upgrades for human players; bots use base).
 interface EffectiveStats {
   range: number;
   speed: number;
@@ -83,6 +106,18 @@ interface EffectiveStats {
   damage: number;
   ballistics: boolean;
 }
+/**
+ * Compute a unit's effective combat stats by folding the owning player's
+ * purchased upgrades into the base tunables. Bots (or any owner without a
+ * playerStats entry) use the bare base values.
+ *
+ * Damage is locked into each projectile at fire time via {@link fireAt},
+ * so future damage upgrades don't retroactively buff arrows already in
+ * the air.
+ *
+ * Ballistics is the union of the server-wide debug toggle and the
+ * per-player upgrade — either one being on enables target-leading.
+ */
 function getEffectiveStats(owner: PlayerId): EffectiveStats {
   const s = playerStats.get(owner);
   const u = s?.upgrades;
@@ -131,9 +166,15 @@ function spawnUnitsForPlayer(player: PlayerId): number[] {
   return ids;
 }
 
-function spawnBot(): number {
+/**
+ * Spawn one bot archer at a random spot on the right half of the map.
+ *
+ * `caps` lets callers override the bot's per-instance capabilities (e.g.
+ * a future "wave N spawns strafing bots" rule can pass `canStrafe: true`).
+ * Anything not specified falls back to {@link DEFAULT_BOT_CAPS}.
+ */
+function spawnBot(caps: Partial<BotCaps> = {}): number {
   const id = nextEntityId++;
-  // Scatter bots on the right half of the map
   const x = MAP_W * 0.55 + Math.random() * (MAP_W * 0.4);
   const y = 80 + Math.random() * (MAP_H - 160);
   units.set(id, {
@@ -151,6 +192,10 @@ function spawnBot(): number {
     attackTargetId: null,
   });
   botUnitIds.add(id);
+  botState.set(id, {
+    caps: { ...DEFAULT_BOT_CAPS, ...caps },
+    strafe: null,
+  });
   return id;
 }
 
@@ -159,7 +204,7 @@ function ensureBots() {
   for (const id of [...botUnitIds]) {
     if (!units.has(id)) {
       botUnitIds.delete(id);
-      botMemory.delete(id);
+      botState.delete(id);
     }
   }
   if (!BOT_RESPAWN && botUnitIds.size === 0) return;
@@ -176,9 +221,21 @@ const COLLISION_ITERS = 2;
 const MIN_UNIT_DIST = UNIT_RADIUS * 2;
 const MIN_UNIT_DIST2 = MIN_UNIT_DIST * MIN_UNIT_DIST;
 
+/**
+ * Soft-body unit-vs-unit collision pass.
+ *
+ * Runs an O(n²) pairwise check (cheap enough at io scale, <= ~150 units;
+ * swap in a uniform spatial hash if the cap rises). Each overlapping pair
+ * is pushed apart along their separation normal by half the overlap each;
+ * we run the pass {@link COLLISION_ITERS} times to relax three-body jams.
+ *
+ * Two units that land exactly on top of each other (zero distance) are
+ * separated along a deterministic axis derived from their ids so the
+ * outcome is stable rather than dependent on iteration order.
+ *
+ * Finally, every unit is clamped inside the map bounds.
+ */
 function resolveCollisions() {
-  // Simple O(n^2) pairwise separation. Fine for io-scale (<= ~150 units);
-  // swap in a uniform spatial hash if unit counts grow.
   const arr = [...units.values()];
   for (let iter = 0; iter < COLLISION_ITERS; iter++) {
     for (let i = 0; i < arr.length; i++) {
@@ -241,8 +298,19 @@ function targetVelocity(t: UnitState): { vx: number; vy: number } {
   return { vx: (dx / d) * UNIT_SPEED, vy: (dy / d) * UNIT_SPEED };
 }
 
-// Solve t > 0 such that |T0 + V*t - S| = projSpeed * t (intercept time).
-// Returns null if no positive real solution (target faster / fleeing).
+/**
+ * Solve for the time `t > 0` at which a projectile fired from `(sx, sy)`
+ * at speed `projSpeed` would meet a target currently at `(tx, ty)` moving
+ * with velocity `(vx, vy)`. This is the standard linear-intercept
+ * quadratic:
+ *
+ *   |(T₀ + V·t) - S| = projSpeed · t
+ *   ⇒ (V² - projSpeed²)·t² + 2·(D·V)·t + |D|² = 0
+ *
+ * where D = T₀ - S. Returns the smallest positive root, or `null` if
+ * the target is faster than the projectile and running away (no real
+ * solution). Used by {@link fireAt} when ballistics is on.
+ */
 function interceptTimeAt(
   sx: number,
   sy: number,
@@ -271,6 +339,18 @@ function interceptTimeAt(
   return candidates[0] ?? null;
 }
 
+/**
+ * Spawn a projectile from `u` toward `target`. With ballistics enabled,
+ * we lead the target via {@link interceptTimeAt} using the shooter's
+ * actual (upgraded) projectile speed; otherwise we aim at the target's
+ * current position.
+ *
+ * The spawned projectile bakes in `dmg` and `vx/vy` from the shooter's
+ * effective stats at fire time, so subsequent damage / projectile-speed
+ * upgrades don't retroactively change in-flight arrows.
+ *
+ * Side effect: sets `u.cooldown = UNIT_ATTACK_CD` (post-shot reload).
+ */
 function fireAt(u: UnitState, target: UnitState) {
   const eff = getEffectiveStats(u.owner);
   let aimX = target.x;
@@ -301,15 +381,77 @@ function fireAt(u: UnitState, target: UnitState) {
   u.cooldown = UNIT_ATTACK_CD;
 }
 
-// ---------------------------------------------------------------------------
-// Bot AI
-// ---------------------------------------------------------------------------
-// Each bot picks the nearest enemy (any non-bot, since all bots share owner =
-// BOT_PLAYER) and locks onto it via attackTargetId. The shared step() logic
-// then chases-and-shoots exactly like a player-issued attack-click.
-//
-// Cheap enough to run every tick (B bots * N units). When we add more AI
-// flavors (skirmisher, defender, etc.) this is the seam to branch on.
+/**
+ * Apply an ability cast. Validates ownership, unlock state, and per-unit
+ * cooldown for each id, then dispatches to the per-ability effect.
+ *
+ * Effects are intentionally instantaneous server-side — the client sees
+ * the result via the next snapshot. For more complex casts (channeling,
+ * AoE damage) this is the seam to extend.
+ */
+function castAbility(
+  player: PlayerId,
+  client: Client,
+  kind: AbilityKind,
+  ids: number[],
+  x: number,
+  y: number,
+) {
+  const def = ABILITIES[kind];
+  if (!def) return;
+  const ps = ensurePlayerStats(player);
+  if ((ps.abilities[kind] ?? 0) <= 0) return; // not unlocked
+  const owned = new Set(client.unitIds);
+  for (const id of ids) {
+    if (!owned.has(id)) continue;
+    const u = units.get(id);
+    if (!u) continue;
+    const cd = u.abilityCds?.[kind] ?? 0;
+    if (cd > 0) continue;
+    if (kind === "blink") {
+      // Teleport toward (x,y), capped at BLINK_MAX_DIST. Then clamp to map.
+      const dx = x - u.x;
+      const dy = y - u.y;
+      const d = Math.hypot(dx, dy);
+      const step = Math.min(d, BLINK_MAX_DIST);
+      if (d > 0) {
+        u.x += (dx / d) * step;
+        u.y += (dy / d) * step;
+      }
+      if (u.x < UNIT_RADIUS) u.x = UNIT_RADIUS;
+      else if (u.x > MAP_W - UNIT_RADIUS) u.x = MAP_W - UNIT_RADIUS;
+      if (u.y < UNIT_RADIUS) u.y = UNIT_RADIUS;
+      else if (u.y > MAP_H - UNIT_RADIUS) u.y = MAP_H - UNIT_RADIUS;
+      // Drop ALL prior movement intent so the unit doesn't immediately
+      // resume walking toward an old waypoint or chasing an old target.
+      u.targetX = null;
+      u.targetY = null;
+      u.attackMove = false;
+      u.attackTargetId = null;
+      // Cancel any in-progress aim so the teleport doesn't release a shot
+      // from the wrong origin on the next tick.
+      u.windup = 0;
+      // Brief post-blink lockout so movement commands don't take effect
+      // for a fraction of a second after landing -- gives the teleport a
+      // clean visual settle.
+      u.moveLockSec = BLINK_MOVE_LOCK_SEC;
+    }
+    if (!u.abilityCds) u.abilityCds = {};
+    u.abilityCds[kind] = def.cooldownSec;
+  }
+}
+
+/**
+ * Per-tick bot AI update.
+ *
+ * Each bot locks `attackTargetId` to the nearest non-bot unit. The shared
+ * {@link step} pipeline then chases, winds up, fires, and (during cooldown)
+ * strafes around the target — identical to a human-issued attack-click
+ * plus the bot-only strafe rule in `step()`.
+ *
+ * Cheap enough to run every tick (`B * N` distance checks). When other AI
+ * flavors (skirmisher, defender, …) are added, branch in here.
+ */
 function updateBotAI() {
   for (const id of botUnitIds) {
     const bot = units.get(id);
@@ -323,10 +465,57 @@ function updateBotAI() {
   }
 }
 
+/**
+ * Advance the simulation by `dt` seconds. This is the heart of the server.
+ *
+ * For every unit, in order:
+ *
+ *   1. Decrement `cooldown`.
+ *   2. Resolve a focused-fire `attackTargetId` lock (drop if dead/friendly).
+ *   3. Decide whether to engage this tick:
+ *        - locked + in range: yes (forces a stop, accumulates windup).
+ *        - idle (no command): yes if any enemy is in range.
+ *        - attack-move with waypoint: yes if any enemy is in range
+ *          (stutter-step: stop, wind up, fire, then resume moving).
+ *        - plain right-click move: never; the unit ignores enemies.
+ *      When engaging, accumulate `windup`; once it crosses the threshold,
+ *      call {@link fireAt} and reset windup. Movement is forced off this
+ *      tick so the shot has a stable origin.
+ *   4. If locked + in range and not winding (i.e. on cooldown):
+ *        - bots strafe perpendicular to the target line at full effective
+ *          speed (direction picked once per cooldown via {@link botMemory},
+ *          with a 70/30 persistence bias across cooldowns to produce visible
+ *          circle-strafing rather than per-tick jitter).
+ *        - player units simply hold position.
+ *   5. Otherwise apply movement: chase the locked target if out of range,
+ *      else step toward `targetX/Y` (clearing the waypoint on arrival).
+ *
+ * After the per-unit pass we run {@link resolveCollisions} (soft-body
+ * separation) and integrate projectiles, applying damage and crediting
+ * kills to the projectile owner's playerStats (humans only).
+ */
 function step(dt: number) {
   // Units
   for (const u of units.values()) {
     if (u.cooldown > 0) u.cooldown = Math.max(0, u.cooldown - dt);
+
+    // Tick down per-ability cooldowns; sparse-prune ready abilities so the
+    // protocol stays compact (snapshot omits keys that are at zero).
+    if (u.abilityCds) {
+      for (const k in u.abilityCds) {
+        const kk = k as AbilityKind;
+        const v = u.abilityCds[kk]!;
+        const next = v - dt;
+        if (next <= 0) delete u.abilityCds[kk];
+        else u.abilityCds[kk] = next;
+      }
+    }
+    // Tick down the post-displacement movement lock and clear when done.
+    if (u.moveLockSec !== undefined) {
+      const next = u.moveLockSec - dt;
+      if (next <= 0) delete u.moveLockSec;
+      else u.moveLockSec = next;
+    }
 
     const eff = getEffectiveStats(u.owner);
     const range2 = eff.range * eff.range;
@@ -392,38 +581,41 @@ function step(dt: number) {
       const d2 = dist2(u.x, u.y, lockedEnemy!.x, lockedEnemy!.y);
       const hold = eff.range - 4;
       if (d2 <= hold * hold) {
-        if (u.owner === BOT_PLAYER && u.cooldown > 0) {
-          let mem = botMemory.get(u.id);
-          if (!mem) {
-            mem = {
-              strafeDir: Math.random() < 0.5 ? -1 : 1,
+        const bs = u.owner === BOT_PLAYER ? botState.get(u.id) : null;
+        if (bs?.caps.canStrafe && u.cooldown > 0) {
+          let st = bs.strafe;
+          if (!st) {
+            st = {
+              dir: Math.random() < 0.5 ? -1 : 1,
               lastCd: u.cooldown,
             };
-            botMemory.set(u.id, mem);
-          } else if (u.cooldown > mem.lastCd) {
+            bs.strafe = st;
+          } else if (u.cooldown > st.lastCd) {
             // Cooldown just rose -> we fired last tick. Re-pick with bias.
             if (Math.random() < 0.3) {
-              mem.strafeDir = mem.strafeDir === 1 ? -1 : 1;
+              st.dir = st.dir === 1 ? -1 : 1;
             }
           }
-          mem.lastCd = u.cooldown;
+          st.lastCd = u.cooldown;
           // Perpendicular: rotate (dx,dy) 90deg, scaled by direction sign.
           const dx = lockedEnemy!.x - u.x;
           const dy = lockedEnemy!.y - u.y;
           const d = Math.hypot(dx, dy) || 1;
-          const px = (-dy / d) * mem.strafeDir;
-          const py = (dx / d) * mem.strafeDir;
+          const px = (-dy / d) * st.dir;
+          const py = (dx / d) * st.dir;
           u.x += px * eff.speed * dt;
           u.y += py * eff.speed * dt;
           moveThisTick = false; // skip the default chase/hold path
         } else {
-          moveThisTick = false; // player units / winding bots: just hold
+          moveThisTick = false; // hold (player units, non-strafe bots)
         }
       }
     }
 
-    // Movement
-    if (moveThisTick) {
+    // Movement -- skipped entirely while the post-blink settle lock is
+    // active so a freshly-teleported unit doesn't slide off toward a
+    // stale or freshly-issued waypoint within the same tick.
+    if (moveThisTick && !u.moveLockSec) {
       if (hasLocked && !inRangeOfLocked) {
         // Chase the locked target. Don't store this in u.targetX/Y; the
         // intent is "follow this unit", not "go to that point".
@@ -508,6 +700,7 @@ function buildSnapshot(forPlayer: PlayerId): Snapshot {
       kills: s.kills,
       points: s.points,
       upgrades: { ...s.upgrades },
+      abilities: { ...s.abilities },
     },
   };
 }
@@ -552,6 +745,17 @@ const MIME: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+/**
+ * Static-file handler for the production single-port deployment.
+ *
+ * Resolves request paths under `dist/`, blocks any path-traversal that
+ * escapes the dist root, falls back to `index.html` for unknown paths
+ * (SPA-style), and tags hashed `assets/*` files with long-lived
+ * immutable caching while keeping `index.html` non-cached.
+ *
+ * If `dist/` doesn't exist (i.e. the developer hasn't run `npm run build`),
+ * we return a helpful 503 explaining how to run dev or build for prod.
+ */
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse) {
   if (!distExists) {
     res.writeHead(503, { "content-type": "text/plain; charset=utf-8" });
@@ -690,6 +894,20 @@ wss.on("connection", (ws) => {
       console.log(
         `[server] player ${player} bought ${msg.kind} -> level ${cur + 1}`,
       );
+    } else if (msg.t === "buyAbility") {
+      const def = ABILITIES[msg.kind as AbilityKind];
+      if (!def) return;
+      const ps = ensurePlayerStats(player);
+      const cur = ps.abilities[msg.kind as AbilityKind] ?? 0;
+      if (ps.points <= 0) return;
+      if (cur >= def.max) return;
+      ps.points -= 1;
+      ps.abilities[msg.kind as AbilityKind] = cur + 1;
+      console.log(
+        `[server] player ${player} unlocked ${msg.kind}`,
+      );
+    } else if (msg.t === "useAbility") {
+      castAbility(player, client, msg.kind, msg.ids, msg.x, msg.y);
     }
   });
 
