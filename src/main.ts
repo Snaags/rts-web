@@ -21,6 +21,16 @@ import {
 
 const INTERP_DELAY_MS = 100;
 
+let zoomLevel = 1.0;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 2.0;
+
+let panX = 0;
+let panY = 0;
+const EDGE_THRESHOLD = 50;
+let mouseX = window.innerWidth / 2;
+let mouseY = window.innerHeight / 2;
+
 interface Buffered {
   recvTime: number;
   serverTime: number;
@@ -154,15 +164,101 @@ app.stage.addChild(world);
 function fitWorld() {
   const sx = window.innerWidth / MAP_W;
   const sy = window.innerHeight / MAP_H;
-  const s = Math.min(sx, sy);
+  const baseScale = Math.min(sx, sy);
+  const s = baseScale * zoomLevel;
+  
+  const scaledW = MAP_W * s;
+  const scaledH = MAP_H * s;
+  
+  const mapFillsViewport = scaledW <= window.innerWidth && scaledH <= window.innerHeight;
+  
+  const PAN_MARGIN = 0.33;
+  
+  if (mapFillsViewport) {
+    panX = 0;
+    panY = 0;
+  } else {
+    const minPanX = window.innerWidth - scaledW - (scaledW * PAN_MARGIN);
+    const maxPanX = scaledW * PAN_MARGIN;
+    const minPanY = window.innerHeight - scaledH - (scaledH * PAN_MARGIN);
+    const maxPanY = scaledH * PAN_MARGIN;
+    
+    panX = Math.max(minPanX, Math.min(maxPanX, panX));
+    panY = Math.max(minPanY, Math.min(maxPanY, panY));
+  }
+  
   world.scale.set(s);
-  world.position.set(
-    (window.innerWidth - MAP_W * s) / 2,
-    (window.innerHeight - MAP_H * s) / 2,
-  );
+  
+  if (mapFillsViewport) {
+    world.position.set(
+      (window.innerWidth - scaledW) / 2,
+      (window.innerHeight - scaledH) / 2,
+    );
+  } else {
+    world.position.set(panX, panY);
+  }
 }
 fitWorld();
 window.addEventListener("resize", fitWorld);
+
+app.canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? 0.9 : 1.1;
+  const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel * delta));
+  
+  const rect = app.canvas.getBoundingClientRect();
+  const mouseRelX = e.clientX - rect.left;
+  const mouseRelY = e.clientY - rect.top;
+  
+  const worldX = (mouseRelX - world.position.x) / world.scale.x;
+  const worldY = (mouseRelY - world.position.y) / world.scale.y;
+  
+  zoomLevel = newZoom;
+  fitWorld();
+  
+  const newScreenX = worldX * world.scale.x + world.position.x;
+  const newScreenY = worldY * world.scale.y + world.position.y;
+  
+  panX += mouseRelX - newScreenX;
+  panY += mouseRelY - newScreenY;
+  fitWorld();
+}, { passive: false });
+
+let isPanning = false;
+let lastPanMouseX = 0;
+let lastPanMouseY = 0;
+
+app.canvas.addEventListener("mousedown", (e) => {
+  if (e.button === 1) {
+    e.preventDefault();
+    isPanning = true;
+    lastPanMouseX = e.clientX;
+    lastPanMouseY = e.clientY;
+    app.canvas.style.cursor = "grabbing";
+  }
+});
+
+window.addEventListener("mouseup", (e) => {
+  if (e.button === 1 && isPanning) {
+    isPanning = false;
+    app.canvas.style.cursor = "default";
+  }
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (isPanning) {
+    const dx = e.clientX - lastPanMouseX;
+    const dy = e.clientY - lastPanMouseY;
+    panX += dx;
+    panY += dy;
+    lastPanMouseX = e.clientX;
+    lastPanMouseY = e.clientY;
+    fitWorld();
+  }
+  const rect = app.canvas.getBoundingClientRect();
+  mouseX = e.clientX - rect.left;
+  mouseY = e.clientY - rect.top;
+});
 
 // Background
 const bg = new Graphics()
@@ -658,6 +754,26 @@ app.ticker.add(() => {
   // Move marker fade
   const age = performance.now() - moveMarkerAt;
   moveMarker.alpha = Math.max(0, 1 - age / 600);
+
+  // Edge panning - only when map exceeds viewport
+  const scaledW = MAP_W * world.scale.x;
+  const scaledH = MAP_H * world.scale.y;
+  const mapExceedsViewport = scaledW > window.innerWidth || scaledH > window.innerHeight;
+  
+  if (mapExceedsViewport) {
+    let panDeltaX = 0;
+    let panDeltaY = 0;
+    if (mouseX < EDGE_THRESHOLD) panDeltaX = EDGE_THRESHOLD - mouseX;
+    else if (mouseX > window.innerWidth - EDGE_THRESHOLD) panDeltaX = (window.innerWidth - EDGE_THRESHOLD) - mouseX;
+    if (mouseY < EDGE_THRESHOLD) panDeltaY = EDGE_THRESHOLD - mouseY;
+    else if (mouseY > window.innerHeight - EDGE_THRESHOLD) panDeltaY = (window.innerHeight - EDGE_THRESHOLD) - mouseY;
+    
+    if (panDeltaX !== 0 || panDeltaY !== 0) {
+      panX += panDeltaX;
+      panY += panDeltaY;
+      fitWorld();
+    }
+  }
 
   if (!state) return;
 
