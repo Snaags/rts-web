@@ -181,6 +181,16 @@ export interface Snapshot {
   projectiles: ProjectileState[];
   options: ServerOptions;
   myStats: PlayerStats;
+  // Per-player kill totals. Sorted by kills descending so the client can
+  // render directly. Includes every player that has ever connected (alive
+  // or disconnected) and excludes bots.
+  leaderboard: LeaderboardEntry[];
+}
+
+export interface LeaderboardEntry {
+  player: PlayerId;
+  kills: number;
+  connected: boolean; // false if the player has left but their score remains
 }
 
 export interface WelcomeMsg {

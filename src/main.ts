@@ -5,6 +5,7 @@ import {
   AbilityKind,
   ClientMsg,
   EntityId,
+  LeaderboardEntry,
   MAP_H,
   MAP_W,
   PROJ_RADIUS,
@@ -66,6 +67,8 @@ const controlGroups = new Map<number, Set<EntityId>>();
 const statsEl = document.getElementById("stats")!;
 const upgradesEl = document.getElementById("upgrades")!;
 const groupsEl = document.getElementById("groups")!;
+const leaderboardEl = document.getElementById("leaderboard")!;
+let leaderboard: LeaderboardEntry[] = [];
 
 // Visible boot/connection status. Renders even if Pixi or the WS dies, so
 // failures over Cloudflare/Caddy/etc. are diagnosable without devtools.
@@ -348,6 +351,10 @@ ws.onmessage = (ev) => {
     if (msg.options) serverOptions = msg.options;
     if (msg.myStats) {
       myStats = msg.myStats;
+    }
+    if (msg.leaderboard) {
+      leaderboard = msg.leaderboard;
+      renderLeaderboard();
     }
     // Re-render the panel each snap so ability cooldown counters tick
     // visibly even when myStats itself didn't change.
@@ -798,9 +805,40 @@ groupsEl.addEventListener("click", (e) => {
   if (alive.length > 0) selected = new Set(alive);
 });
 
+/**
+ * Render the kill leaderboard.
+ *
+ * Server sends entries pre-sorted by kills desc, so we just walk the list.
+ * The current player's row gets a subtle highlight; disconnected players
+ * are dimmed but still listed so their score is preserved across drops.
+ */
+function renderLeaderboard() {
+  if (leaderboard.length === 0) {
+    leaderboardEl.innerHTML =
+      `<div class="head">Leaderboard</div>` +
+      `<div style="color:#5a6168;font-style:italic">no players yet</div>`;
+    return;
+  }
+  const rows = leaderboard
+    .map((e, i) => {
+      const cls = [
+        "row",
+        e.player === myPlayer ? "me" : "",
+        e.connected ? "" : "offline",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const tag = e.connected ? "" : " (offline)";
+      return `<div class="${cls}"><span class="rank">#${i + 1}</span><span class="who">P${e.player}${tag}</span><span class="kills">${e.kills}</span></div>`;
+    })
+    .join("");
+  leaderboardEl.innerHTML = `<div class="head">Leaderboard</div>` + rows;
+}
+
 // Initial render so the panels show even before the first snapshot arrives.
 renderUpgradePanel();
 renderGroupsPanel();
+renderLeaderboard();
 
 function issueMove(x: number, y: number, attackMove: boolean) {
   if (selected.size === 0) return;
@@ -1058,7 +1096,11 @@ app.ticker.add(() => {
     }
   }
 
-  // Projectiles
+  // Projectiles. The player's own shots render as a short arrow / tracer
+  // streak oriented along the velocity vector -- easier to read at a
+  // glance ("there go MY arrows") than the generic dot. Enemy projectiles
+  // keep the legacy circle so incoming danger looks distinct from your
+  // own outgoing fire.
   const seenP = new Set<EntityId>();
   for (const p of state.projectiles.values()) {
     seenP.add(p.id);
@@ -1070,7 +1112,20 @@ app.ticker.add(() => {
     }
     g.clear();
     const mine = p.owner === myPlayer;
-    g.circle(0, 0, PROJ_RADIUS).fill(mine ? 0xb6e3ff : 0xffd070);
+    if (mine) {
+      // Arrow: a short tail + bright head, rotated along velocity. The tip
+      // sits at local (0,0) so the visual position matches the server's
+      // simulated point exactly (no offset between sprite and hit-test).
+      const tail = 12;
+      g.rotation = Math.atan2(p.vy, p.vx);
+      g.moveTo(-tail, 0)
+        .lineTo(0, 0)
+        .stroke({ width: 2, color: 0xb6e3ff, alpha: 0.9 });
+      g.circle(0, 0, 2).fill(0xeaf6ff);
+    } else {
+      g.rotation = 0;
+      g.circle(0, 0, PROJ_RADIUS).fill(0xffd070);
+    }
     g.position.set(p.x, p.y);
   }
   for (const [id, g] of projGfx) {

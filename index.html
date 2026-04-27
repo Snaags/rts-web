@@ -64,6 +64,21 @@
         color: #cfd6dd; min-width: 12px; text-align: center;
       }
       #groups .grpcount { color: #8ad0a0; }
+      #leaderboard {
+        background: rgba(15, 18, 22, 0.85); border: 1px solid #2a3138;
+        border-radius: 6px; padding: 8px 10px; font-size: 12px;
+        line-height: 1.35; user-select: none;
+      }
+      #leaderboard .head { color: #8ecaff; margin-bottom: 6px; font-weight: 600; letter-spacing: 0.3px; }
+      #leaderboard .row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 2px 4px; margin: 1px -4px; border-radius: 4px;
+      }
+      #leaderboard .row.me { background: rgba(140, 200, 255, 0.10); }
+      #leaderboard .row.offline { opacity: 0.45; }
+      #leaderboard .rank { color: #6a7480; min-width: 18px; text-align: right; }
+      #leaderboard .who { flex: 1; color: #cfd6dd; }
+      #leaderboard .kills { color: #8ad0a0; min-width: 28px; text-align: right; }
     </style>
   </head>
   <body>
@@ -77,6 +92,7 @@
     <div id="right-panel">
       <div id="upgrades"></div>
       <div id="groups"></div>
+      <div id="leaderboard"></div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

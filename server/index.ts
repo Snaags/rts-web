@@ -33,6 +33,7 @@ import {
   AbilityKind,
   BLINK_MAX_DIST,
   BLINK_MOVE_LOCK_SEC,
+  LeaderboardEntry,
   effectiveRange,
   emptyAbilities,
   emptyUpgrades,
@@ -537,37 +538,48 @@ function step(dt: number) {
     const idle = !hasWaypoint && !hasLocked;
     let moveThisTick = hasWaypoint || hasLocked;
 
-    // Firing:
-    //   - locked: only fire at the locked target, only if in range
+    // Targeting:
+    //   - locked: only consider the locked target, only if in range
     //   - idle / attack-move: auto-acquire nearest enemy in range
     //   - plain move (waypoint without attackMove and no locked): never fire
-    const canEngage =
-      u.cooldown === 0 &&
-      (hasLocked || idle || (hasWaypoint && u.attackMove));
-    let winding = false;
+    // We resolve the in-range enemy regardless of cooldown so we can stop
+    // an attack-moving unit from walking past its firing position while
+    // its weapon is still on cooldown -- a unit that "could" shoot if its
+    // cooldown were ready should stand still, not stutter forward.
+    const shouldAutoTarget =
+      hasLocked || idle || (hasWaypoint && u.attackMove);
+    let enemyInRange: UnitState | null = null;
     let inRangeOfLocked = false;
-    if (canEngage) {
-      let enemy: UnitState | null = null;
+    if (shouldAutoTarget) {
       if (hasLocked) {
         const d2 = dist2(u.x, u.y, lockedEnemy!.x, lockedEnemy!.y);
         if (d2 <= range2) {
-          enemy = lockedEnemy;
+          enemyInRange = lockedEnemy;
           inRangeOfLocked = true;
         }
       } else {
         const e = findNearestEnemy(u);
         if (e && dist2(u.x, u.y, e.x, e.y) <= range2) {
-          enemy = e;
+          enemyInRange = e;
         }
       }
-      if (enemy) {
-        winding = true;
-        moveThisTick = false; // must hold still to wind up / fire
-        u.windup = Math.min(UNIT_ATTACK_WINDUP, u.windup + dt);
-        if (u.windup >= UNIT_ATTACK_WINDUP) {
-          fireAt(u, enemy);
-          u.windup = 0;
-        }
+    }
+
+    // Attack-move "stand and shoot": once a target is in range, hold
+    // position even during cooldown. The locked-target case is handled
+    // further down (strafe-or-hold block) so we leave hasLocked to it.
+    if (enemyInRange && hasWaypoint && u.attackMove && !hasLocked) {
+      moveThisTick = false;
+    }
+
+    let winding = false;
+    if (enemyInRange && u.cooldown === 0) {
+      winding = true;
+      moveThisTick = false; // must hold still to wind up / fire
+      u.windup = Math.min(UNIT_ATTACK_WINDUP, u.windup + dt);
+      if (u.windup >= UNIT_ATTACK_WINDUP) {
+        fireAt(u, enemyInRange);
+        u.windup = 0;
       }
     }
     if (!winding) u.windup = 0;
@@ -688,6 +700,20 @@ function step(dt: number) {
 
 function buildSnapshot(forPlayer: PlayerId): Snapshot {
   const s = ensurePlayerStats(forPlayer);
+  // Set of currently-connected player ids, used to mark leaderboard rows
+  // as online/offline. Built fresh per snapshot -- O(clients) is trivial.
+  const connectedPlayers = new Set<PlayerId>();
+  for (const c of clients) connectedPlayers.add(c.player);
+  const leaderboard: LeaderboardEntry[] = [];
+  for (const [pid, ps] of playerStats) {
+    leaderboard.push({
+      player: pid,
+      kills: ps.kills,
+      connected: connectedPlayers.has(pid),
+    });
+  }
+  // Stable sort: kills desc, then player id asc as a deterministic tiebreaker.
+  leaderboard.sort((a, b) => b.kills - a.kills || a.player - b.player);
   return {
     t: "snap",
     tick,
@@ -702,6 +728,7 @@ function buildSnapshot(forPlayer: PlayerId): Snapshot {
       upgrades: { ...s.upgrades },
       abilities: { ...s.abilities },
     },
+    leaderboard,
   };
 }
 
@@ -914,7 +941,9 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     clients.delete(client);
     for (const id of client.unitIds) units.delete(id);
-    playerStats.delete(player);
+    // Keep playerStats around after disconnect so the leaderboard still
+    // shows the player's score (with `connected: false`). They're cheap
+    // to retain and re-attaching by player id isn't currently supported.
     console.log(`[server] player ${player} disconnected`);
   });
 });
